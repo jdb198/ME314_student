@@ -34,7 +34,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'xarm_commander = me314_py.xarm_planner.xarm_commander:main',
+            'xarm_commander = me314_pkg.me314_py.xarm_planner.xarm_commander:main',
         ],
     },
 )
