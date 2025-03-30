@@ -34,7 +34,6 @@ install(PROGRAMS
   me314_py/teleoperation/list_hid.py
   me314_py/drivers/install_spacemouse.py
   me314_py/xarm_planner/xarm_a2b_example.py
-  me314_py/xarm_planner/pick_and_place.py
   me314_py/xarm_planner/xarm_commander.py
   DESTINATION lib/${PROJECT_NAME}
 )
