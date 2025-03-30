@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>me314_pkg</name>
+  <version>0.0.1</version>
+  <description>A ROS2 package for ME314 Robotic Dexterity</description>
+  <maintainer email="aqiu34@stanford.edu">Alex Qiu</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- Build tools -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+  <!-- Build dependencies -->
+  <build_depend>me314_msgs</build_depend>
+  <build_depend>rclcpp</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>moveit_ros_planning_interface</build_depend>
+  <build_depend>xarm_planner</build_depend>
+  <build_depend>xarm_msgs</build_depend>
+  <build_depend>xarm_moveit_config</build_depend>
+
+  <!-- Runtime dependencies -->
+  <exec_depend>me314_msgs</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>xarm_ros2</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
