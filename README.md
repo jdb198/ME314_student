@@ -132,7 +132,7 @@ clear
 ros2 launch me314_pkg me314_xarm_gazebo.launch.py
 ```
 
-It may take a while, but you should see the xarm7 spawn on a table, with a red block in front of it. (If this fails try ctrl+c and re-running the command)
+It may take a while, but you should see the xarm7 spawn on a table, with a red block in front of it. (This will likely fail the first time you run the command after starting the container, Gazebo takes a really long time to load. Let it fully load with errors and then ctrl+c and re-run the command)
 
 4. To test an example script that commands the xarm to move from point A to B, run the following command in a separate terminal while gazebo and rviz are open:
 
