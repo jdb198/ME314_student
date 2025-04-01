@@ -112,6 +112,7 @@ class ME314_XArm_Queue_Commander(Node):
             self.initialization_complete = True
         else:
             self.get_logger().warn("Initialization failed. Gripper open command failed.")
+            self.initialization_complete = True
     
     def command_queue_callback(self, msg: CommandQueue):
         with self.queue_lock:
