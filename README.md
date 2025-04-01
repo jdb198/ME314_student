@@ -184,6 +184,14 @@ cd ~/xarm_ros2_ws/src
 git clone https://github.com/armlabstanford/ME314_student.git
 ```
 
+#### Clone xarm_ros2
+
+```bash
+cd ~/xarm_ros2_ws/src
+git clone https://github.com/RealSoloQ/xarm_ros2.git --recursive -b $ROS_DISTRO
+rosdep update && rosdep install --from-paths . --ignore-src --rosdistro $ROS_DISTRO -y --skip-keys="roscpp catkin"
+```
+
 #### Build Workspace (this should only need to be done once if using --symlink-install, which prevents you from having to rebuild workspace after python file changes)
 
 ```bash
