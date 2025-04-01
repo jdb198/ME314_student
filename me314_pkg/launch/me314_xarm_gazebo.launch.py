@@ -30,7 +30,7 @@ def generate_launch_description():
     )
 
     block_spawn = TimerAction(
-        period=20.0,  # give Gazebo time to start
+        period=15.0,  # give Gazebo time to start
         actions=[Node(
             package='gazebo_ros',
             executable='spawn_entity.py',

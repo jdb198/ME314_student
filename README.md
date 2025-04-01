@@ -6,6 +6,126 @@ The ME314_XArm package provides Python-based control and teleoperation functiona
 Please stay away from the robot arm during operation to avoid personal injury or equipment damage.
 Ensure e-stop is close and accessible before controlling arm.
 
+### Setting up Docker Image (for Windows and Mac users)
+1. Install Docker Desktop (or Docker Engine for CLI only)
+2. In terminal run: 
+
+```bash
+docker pull aqiu218/me314_xarm_ros2
+```
+
+4. Clone ME314_student repo to your computer
+
+```bash
+git clone https://github.com/armlabstanford/ME314_student.git
+```
+
+3. Start container using the following command (only needs to be run once): 
+
+docker run --privileged --name <name-of-container> -p 6080:80 --shm-size=512m -v <path/to/ME314_student>:<docker/path/to/xarm_ros2_ws> aqiu218/me314_xarm_ros2
+
+** In the above command, *-v <computer-path>:<docker-path>* mounts a folder on your local computer to the docker container, thus linking any files/directories/changes made on local to your docker container ubuntu system. 
+** --name sets the name of the container, this can be set to anything you want. We want to link our ME314_student folder from our host device to the virtualized ubuntu system.
+
+Example:
+
+```bash
+docker run --privileged --name me314_ros2 -p 6080:80 --shm-size=512m -v /home/alex/ME314_student:/home/ubuntu/xarm_ros2_ws/src/me314 aqiu218/me314_xarm_ros2
+```
+
+** WE HIGHLY RECOMMEND ONLY CHANGING THE COMPUTER PATH TO YOUR ME314_student REPO IN THE ABOVE EXAMPLE COMMAND **
+
+4. Navigate to http://localhost:6080/ and click connect. You should now see a full Ubuntu Linux desktop environment!
+
+5. Stop container by pressing ctrl+c in host device (your laptop) terminal
+
+6. To run container in the future, run the following command in your terminal and navigate to http://localhost:6080/:
+
+```bash
+docker start me314_ros2
+```
+7. To stop container (run in terminal): 
+
+```bash
+docker stop me314_ros2
+```
+
+### Testing out the me314_pkg!
+
+1. Navigate to terminal (if using native Linux) or double click on Terminator on home screen.
+
+2. Build your ROS2 workspace (you should only need to build the first time you start your docker container):
+
+```bash
+cd /home/ubuntu/xarm_ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-select me314_pkg me314_msgs
+source install/setup.bash
+```
+
+You will see some warnings, these can be ignored.
+
+3. To start gazebo simulation (and RViz), run the following launch command in the same terminal:
+
+```bash
+ros2 launch me314_pkg me314_xarm_gazebo.launch.py
+```
+
+This will take a while and will likely fail the first time you run this command when starting the container since Gazebo loads very slowly, ctrl+c and re-run the command after gazebo fully opens but no robot appears. Now you should see the xarm7 spawn on a table, with a red block in front of it.
+
+4. To test an example script that commands the xarm to move from point A to B, run the following command in a separate terminal while gazebo and rviz are open:
+
+```bash
+cd xarm_ros2_ws
+source install/setup.bash
+clear
+ros2 run me314_pkg xarm_a2b_example.py
+```
+
+### Commands Summary
+#### Navigate to Workspace and Source Install Before Running Any Commands
+
+```bash
+cd xarm_ros2_ws
+source install/setup.bash
+```
+
+#### Tele-Operation with Spacemouse
+
+```bash
+ros2 run me314_pkg xarm_spacemouse_ros2.py
+```
+
+#### Control XArm using XArm Planner (with MoveIt API) (RECOMMENDED)
+
+1. Control in Gazebo
+
+a. In one terminal run the following command:
+
+```bash
+ros2 launch me314_pkg me314_xarm_gazebo.launch.py
+```
+
+b. In another terminal run script (example):
+
+```bash
+ros2 run me314_pkg xarm_a2b_example.py
+```
+
+2. Control in Real
+
+a. In one terminal run the xarm planner launch command:
+
+```bash
+ros2 launch me314_pkg me314_xarm_real.launch.py
+```
+
+b. In another terminal run script (example):
+
+```bash
+ros2 run me314_pkg xarm_a2b_example.py
+```
+
 ### Installation (if using native Linux Ubuntu 22.04 System)
 
 #### Install ros2 humble (for Ubuntu 22.04)
@@ -61,8 +181,7 @@ sudo apt install ros-humble-moveit
 cd ~
 mkdir -p xarm_ros2_ws/src
 cd ~/xarm_ros2_ws/src
-git clone https://github.com/xArm-Developer/xarm_ros2.git --recursive -b $ROS_DISTRO
-git clone https://github.com/RealSoloQ/ME314_XArm.git
+git clone https://github.com/armlabstanford/ME314_student.git
 ```
 
 #### Build Workspace (this should only need to be done once if using --symlink-install, which prevents you from having to rebuild workspace after python file changes)
@@ -76,115 +195,6 @@ colcon build --symlink-install --cmake-args "-DCMAKE_BUILD_TYPE=Release"
 
 ```bash
 ros2 run me314 move_A_to_B.py
-```
-
-### Setting up Docker Image (for Windows and Mac users)
-1. Install Docker Desktop (or Docker Engine for CLI only)
-2. In terminal run: 
-
-```bash
-docker pull aqiu218/me314_xarm_ros2
-```
-
-3. Start container using the following command (only needs to be run once): 
-
-docker run --privileged --name me314 -p 6080:80 --shm-size=512m -v <computer-path>:<docker-path> aqiu218/me314_xarm_ros2
-
-** In the above command, *-v <computer-path>:<docker-path>* mounts a folder on your local computer to the docker container, thus linking any files/directories/changes made on local to your docker container ubuntu system. 
-** --name sets the name of the container, this can be set to anything you want.
-
-Example:
-
-```bash
-docker run --privileged --name me314 -p 6080:80 --shm-size=512m -v /home/alex/Documents/me314_test:/home/ubuntu/Desktop/me314 aqiu218/me314_xarm_ros2
-```
-
-4. Navigate to http://localhost:6080/ and click connect. You should now see a full Ubuntu Linux desktop environment!
-
-5. Stop container by pressing ctrl+c in host device (your laptop) terminal
-
-6. To run container in the future, run the following command in your terminal and navigate to http://localhost:6080/:
-
-```bash
-docker start me314
-```
-7. To stop container (run in terminal): 
-
-```bash
-docker stop me314
-```
-
-### Testing out the me314_pkg!
-
-1. Navigate to terminal (if using native Linux) or navigate to Terminator by clicking on the top left menu button and searching for it.
-
-2. Run the following commands:
-
-```bash
-cd xarm_ros2_ws
-source install/setup.bash
-clear
-```
-
-3. To start gazebo simulation (and RViz), run the following launch command in the same terminal:
-
-```bash
-ros2 launch me314_pkg me314_xarm_gazebo.launch.py
-```
-
-It may take a while, but you should see the xarm7 spawn on a table, with a red block in front of it. (This will likely fail the first time you run the command after starting the container, Gazebo takes a really long time to load. Let it fully load with errors and then ctrl+c and re-run the command)
-
-4. To test an example script that commands the xarm to move from point A to B, run the following command in a separate terminal while gazebo and rviz are open:
-
-```bash
-cd xarm_ros2_ws
-source install/setup.bash
-clear
-ros2 run me314_pkg xarm_a2b_example.py
-```
-
-### Commands Summary
-#### Navigate to Workspace and Source Install Before Running Any Commands
-
-```bash
-cd ~/xarm_ros2_ws
-source install/setup.bash
-```
-
-#### Tele-Operation with Spacemouse
-
-```bash
-ros2 run me314_pkg xarm_spacemouse_ros2.py
-```
-
-#### Control XArm using XArm Planner (with MoveIt API) (RECOMMENDED)
-
-1. Control in Gazebo
-
-a. In one terminal run the following command:
-
-```bash
-ros2 launch me314_pkg me314_xarm_gazebo.launch.py
-```
-
-b. In another terminal run script (example):
-
-```bash
-ros2 run me314_pkg xarm_a2b_example.py
-```
-
-2. Control in Real
-
-a. In one terminal run the xarm planner launch command:
-
-```bash
-ros2 launch me314_pkg me314_xarm_real.launch.py
-```
-
-b. In another terminal run script (example):
-
-```bash
-ros2 run me314_pkg xarm_a2b_example.py
 ```
 
 ### Tips/Notes
