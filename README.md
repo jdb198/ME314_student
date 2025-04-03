@@ -155,6 +155,7 @@ colcon build
 ```bash
 cd ~/xarm_ros2_ws/src
 git clone https://github.com/armlabstanford/ME314_student.git
+cd ~/xarm_ros2_ws
 colcon build --symlink-install --packages-select me314_pkg me314_msgs
 ```
 
