@@ -163,6 +163,7 @@ colcon build --symlink-install --packages-select me314_pkg me314_msgs
 
 - If using Terminator, ctrl+shift+E is shortkey to open side by side terminal tab
 - If xarm isn't spawning in gazebo, try quitting and re-running launch command
+- If encountering the following issue when running a script in docker: **/usr/bin/env: 'python3\r': No such file or directory**, open the file in vscodium and convert the file format from CRLF to LF (bottom right of vscodium)
 - For more info about docker check out this quickstart guide: https://github.com/armlabstanford/collaborative-robotics/wiki/Docker-Quickstart
 - Docker cheat sheet commands here: https://docs.docker.com/get-started/docker_cheatsheet.pdf
 
