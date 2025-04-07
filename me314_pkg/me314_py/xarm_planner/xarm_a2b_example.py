@@ -91,7 +91,7 @@ def main(args=None):
 
     # Define poses using the array format [x, y, z, qx, qy, qz, qw]
     p0 = [0.3408, 0.0021, 0.3029, 1.0, 0.0, 0.0, 0.0]
-    p1 = [p0[0] + 0.2, p0[1], p0[2], 1.0, 0.0, 0.0, 0.0]
+    p1 = [p0[0], p0[1], 0.0, 1.0, 0.0, 0.0, 0.0]
 
     poses = [p0, p1]
 

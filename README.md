@@ -147,6 +147,10 @@ sudo apt install ros-humble-desktop
 ```bash
 sudo apt install gazebo
 sudo apt install ros-humble-gazebo-ros-pkgs
+sudo apt install \
+  ros-humble-gazebo-ros2-control \
+  ros-humble-controller-manager \
+  ros-humble-ros2-control
 ```
 
 #### Install Realsense2 SDK and ROS2 Wrapper
