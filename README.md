@@ -22,7 +22,7 @@ git clone https://github.com/armlabstanford/ME314_student.git
 
 3. Start container using the following command (only needs to be run once): 
 
-docker run --privileged --name <name-of-container> -p 6080:80 --shm-size=512m -v <path/to/ME314_student>:<docker/path/to/xarm_ros2_ws> aqiu218/me314_xarm_ros2
+docker run --privileged --name me314_ros2 -p 6080:80 --shm-size=512m -v _**<path/to/ME314_student>**:_/home/ubuntu/xarm_ros2_ws/src/me314 aqiu218/me314_xarm_ros2
 
 ** In the above command, *-v <computer-path>:<docker-path>* mounts a folder on your local computer to the docker container, thus linking any files/directories/changes made on local to your docker container ubuntu system. 
 ** --name sets the name of the container, this can be set to anything you want. We want to link our ME314_student folder from our host device to the virtualized ubuntu system.
@@ -34,6 +34,8 @@ docker run --privileged --name me314_ros2 -p 6080:80 --shm-size=512m -v /home/al
 ```
 
 ** WE HIGHLY RECOMMEND ONLY CHANGING THE COMPUTER PATH TO YOUR ME314_student REPO IN THE ABOVE EXAMPLE COMMAND **
+
+
 
 4. Navigate to http://localhost:6080/ and click connect. You should now see a full Ubuntu Linux desktop environment!
 
@@ -79,50 +81,6 @@ This will take a while and will likely fail the first time you run this command 
 cd xarm_ros2_ws
 source install/setup.bash
 clear
-ros2 run me314_pkg xarm_a2b_example.py
-```
-
-### Commands Summary
-#### Navigate to Workspace and Source Install Before Running Any Commands
-
-```bash
-cd xarm_ros2_ws
-source install/setup.bash
-```
-
-#### Tele-Operation with Spacemouse
-
-```bash
-ros2 run me314_pkg xarm_spacemouse_ros2.py
-```
-
-#### Control XArm using XArm Planner (with MoveIt API) (RECOMMENDED)
-
-1. Control in Gazebo
-
-a. In one terminal run the following command:
-
-```bash
-ros2 launch me314_pkg me314_xarm_gazebo.launch.py
-```
-
-b. In another terminal run script (example):
-
-```bash
-ros2 run me314_pkg xarm_a2b_example.py
-```
-
-2. Control in Real
-
-a. In one terminal run the xarm planner launch command:
-
-```bash
-ros2 launch me314_pkg me314_xarm_real.launch.py
-```
-
-b. In another terminal run script (example):
-
-```bash
 ros2 run me314_pkg xarm_a2b_example.py
 ```
 
@@ -179,40 +137,82 @@ sudo apt install ros-humble-realsense2-*
 sudo apt install ros-humble-moveit
 ```
 
-#### Create xarm_ros2_ws and Clone me314 repo
+#### Create xarm_ros2_ws
 
 ```bash
 cd ~
 mkdir -p xarm_ros2_ws/src
-cd ~/xarm_ros2_ws/src
-git clone https://github.com/armlabstanford/ME314_student.git
 ```
 
-#### Clone xarm_ros2
+#### Clone xarm_ros2 and build
 
 ```bash
 cd ~/xarm_ros2_ws/src
 git clone https://github.com/RealSoloQ/xarm_ros2.git --recursive -b $ROS_DISTRO
 rosdep update && rosdep install --from-paths . --ignore-src --rosdistro $ROS_DISTRO -y --skip-keys="roscpp catkin"
-```
-
-#### Build Workspace (this should only need to be done once if using --symlink-install, which prevents you from having to rebuild workspace after python file changes)
-
-```bash
 cd ~/xarm_ros2_ws
-colcon build --symlink-install --cmake-args "-DCMAKE_BUILD_TYPE=Release"
+colcon build
 ```
 
-#### Control XArm using XArm API in real (not recommended)
+#### Clone ME314_student and build
 
 ```bash
-ros2 run me314 move_A_to_B.py
+cd ~/xarm_ros2_ws/src
+git clone https://github.com/armlabstanford/ME314_student.git
+cd ~/xarm_ros2_ws
+colcon build --symlink-install --packages-select me314_pkg me314_msgs
 ```
 
 ### Tips/Notes
 
 - If using Terminator, ctrl+shift+E is shortkey to open side by side terminal tab
 - If xarm isn't spawning in gazebo, try quitting and re-running launch command
+- If encountering the following issue when running a script in docker: **/usr/bin/env: 'python3\r': No such file or directory**, open the file in vscodium and convert the file format from CRLF to LF (bottom right of vscodium)
 - For more info about docker check out this quickstart guide: https://github.com/armlabstanford/collaborative-robotics/wiki/Docker-Quickstart
-- Docker cheat sheet commands here: https://docs.docker.com/get-started/docker_cheatsheet.pdf 
+- Docker cheat sheet commands here: https://docs.docker.com/get-started/docker_cheatsheet.pdf
+
+### Commands Summary
+#### Navigate to Workspace and Source Install Before Running Any Commands
+
+```bash
+cd xarm_ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+```
+
+#### Tele-Operation with Spacemouse (this only works when connected to real-robot and spacemouse (https://3dconnexion.com/us/product/spacemouse-compact/)
+
+```bash
+ros2 run me314_pkg xarm_spacemouse_ros2.py
+```
+
+#### Control XArm using XArm Planner (with MoveIt API)
+
+1. Control in Gazebo
+
+a. In one terminal run the following command:
+
+```bash
+ros2 launch me314_pkg me314_xarm_gazebo.launch.py
+```
+
+b. In another terminal run script (example):
+
+```bash
+ros2 run me314_pkg xarm_a2b_example.py
+```
+
+2. Control in Real
+
+a. In one terminal run the xarm planner launch command:
+
+```bash
+ros2 launch me314_pkg me314_xarm_real.launch.py
+```
+
+b. In another terminal run script (example):
+
+```bash
+ros2 run me314_pkg xarm_a2b_example.py
+```
 
