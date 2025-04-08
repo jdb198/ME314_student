@@ -10,7 +10,7 @@ def generate_launch_description():
 
     # Add a delay before starting Gazebo to let ROS initialize
     initial_delay = ExecuteProcess(
-        cmd=["sleep", "3"],
+        cmd=["sleep", "5"],
         name="initial_delay"
     )
 
@@ -30,7 +30,7 @@ def generate_launch_description():
     )
 
     block_spawn = TimerAction(
-        period=10.0,  # give Gazebo time to start
+        period=15.0,  # give Gazebo time to start
         actions=[Node(
             package='gazebo_ros',
             executable='spawn_entity.py',
@@ -56,7 +56,7 @@ def generate_launch_description():
     )
     
     # Add a delay before starting the commander
-    delayed_commander = TimerAction(period=15.0, actions=[xarm_pose_commander_node])
+    delayed_commander = TimerAction(period=25.0, actions=[xarm_pose_commander_node])
     
     return LaunchDescription([
         initial_delay,
