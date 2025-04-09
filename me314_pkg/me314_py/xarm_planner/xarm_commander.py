@@ -12,7 +12,7 @@ import threading
 from collections import deque
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, PoseStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String, Bool
 
@@ -25,13 +25,22 @@ from moveit_msgs.msg import (
     MotionPlanRequest,
     Constraints,
     JointConstraint,
-    RobotState
+    RobotState,
+    PlanningScene,
+    LinkPadding
 )
+from moveit_msgs.srv import GetPlanningScene, ApplyPlanningScene
+from shape_msgs.msg import SolidPrimitive
+from moveit_msgs.msg import CollisionObject
 from moveit_msgs.action import ExecuteTrajectory
 
 
 class ME314_XArm_Queue_Commander(Node):
     def __init__(self):
+        """
+        Initialize the ME314_XArm_Queue_Commander node, setting up the command queue,
+        clients, publishers, subscribers, and initial robot state.
+        """
         super().__init__('ME314_XArm_Queue_Commander_Node')
         
         # Define ANSI color codes for terminal output
@@ -56,6 +65,8 @@ class ME314_XArm_Queue_Commander(Node):
         self.plan_path_client = self.create_client(GetMotionPlan, '/plan_kinematic_path')
         self.fk_client = self.create_client(GetPositionFK, '/compute_fk')
         self.execute_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
+        self.get_planning_scene_client = self.create_client(GetPlanningScene, '/get_planning_scene')
+        self.apply_planning_scene_client = self.create_client(ApplyPlanningScene, '/apply_planning_scene')
         self.wait_for_all_services_and_action()
 
         ####################################################################
@@ -69,12 +80,13 @@ class ME314_XArm_Queue_Commander(Node):
         self.home_joints_deg = [1.1, -48.5, 0.4, 32.8, 0.4, 81.9, 0.3]
         self.home_joints_rad = [math.radians(angle) for angle in self.home_joints_deg]
         self.joint_names = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7']
-        self.current_joint_positions = [None] * len(self.joint_names)
+        self.curr_joint_positions = [None] * len(self.joint_names)
 
         self.gripper_group_name = "xarm_gripper"  
-        self.gripper_joint_names = ["drive_joint"]
-        
+        self.gripper_joint_names = ["drive_joint"]  # Matches your MoveIt gripper config
+
         self.initialization_complete = False
+        self.command_failed = False
 
         # Define the workspace bounds in millimeters
         self.x_bounds = (150, 500)   
@@ -82,10 +94,12 @@ class ME314_XArm_Queue_Commander(Node):
         if self.use_sim:
             self.z_bounds = (10, 400) 
         else:
-            self.z_bounds = (35, 400)    
+            self.z_bounds = (35, 400)
 
-        # Tracking how many commands get rejected by manual bound checks
-        self.rejected_commands_count = 0
+        # Initialize planning scene
+        self.planning_scene = PlanningScene()
+        self.planning_scene.is_diff = True
+        self.planning_scene.robot_state.is_diff = True    
 
         ####################################################################
         # SUBSCRIBERS
@@ -99,6 +113,7 @@ class ME314_XArm_Queue_Commander(Node):
         self.current_pose_pub = self.create_publisher(Pose, '/me314_xarm_current_pose', 10)
         self.curr_joint_position_deg_pub = self.create_publisher(JointState, '/me314_xarm_current_joint_positions_deg', 10)
         self.gripper_position_pub = self.create_publisher(Float64, '/me314_xarm_gripper_position', 10)
+        self.complete_joint_state_pub = self.create_publisher(JointState, '/xarm_complete_joint_states', 10)
 
         self.queue_size_pub = self.create_publisher(Float64, '/me314_xarm_queue_size', 10)
         self.is_executing_pub = self.create_publisher(Bool, '/me314_xarm_is_executing', 10)
@@ -118,12 +133,134 @@ class ME314_XArm_Queue_Commander(Node):
         ####################################################################
         self.log_info("Moving to home position (joint-based).")
         self.plan_execute_joint_target_async(self.home_joints_rad, callback=self.home_move_done_callback)
-        self.log_info("Opening gripper fully.")
-        self.plan_execute_gripper_async(0.0, callback=self.init_done_callback)
         self.log_info("XArm queue commander node is starting initialization...")
 
         # Log the workspace bounds
         self.log_info(f"Workspace bounds initialized: X={self.x_bounds}mm, Y={self.y_bounds}mm, Z={self.z_bounds}mm")
+
+        # Store collision objects here so we can reapply them in each planning scene update
+        self.boundary_collision_objects = []
+
+    ####################################################################
+    # PLANNING SCENE METHODS
+    ####################################################################
+    def setup_planning_scene(self):
+        """
+        Setup the planning scene with box constraints to create an open-top box
+        that restricts the robot's end-effector movement.
+        """
+        self.log_info("Setting up planning scene with workspace boundaries...")
+        
+        # Convert mm bounds to meters for planning scene
+        x_l, x_u = self.x_bounds[0] / 1000.0, self.x_bounds[1] / 1000.0
+        y_l, y_u = self.y_bounds[0] / 1000.0, self.y_bounds[1] / 1000.0
+        z_l = self.z_bounds[0] / 1000.0
+
+        x_c = (x_l + x_u) / 2.0
+        y_c = (y_l + y_u) / 2.0
+        x_w = (x_u - x_l) + 0.1 
+        y_w = (y_u - y_l) + 0.1 
+        
+        # Create collision objects for the 5 planes of the box (open top)
+        collision_objects = []
+        
+        # Front wall (max X)
+        collision_objects.append(self.create_box_collision_object("front_wall", 0.01, y_w, 0.6, x_u + 0.005, y_c, 0.25 + z_l))
+        collision_objects.append(self.create_box_collision_object("back_wall", 0.01, y_w, 0.6, x_l - 0.5, y_c, 0.25 + z_l))
+        collision_objects.append(self.create_box_collision_object("left_wall", x_w, 0.01, 0.6, x_c, y_l - 0.005, 0.25 + z_l))
+        collision_objects.append(self.create_box_collision_object("right_wall", x_w, 0.01, 0.6, x_c, y_u + 0.005, 0.25 + z_l))
+        collision_objects.append(self.create_box_collision_object("floor", x_w, y_w, 0.01, x_c, y_c, z_l - 0.005))
+        
+        # Store our boundary collision objects in class attribute
+        self.boundary_collision_objects = collision_objects
+        
+        # Add all collision objects to the planning scene message
+        self.planning_scene.world.collision_objects = self.boundary_collision_objects
+        
+        # Relevant robot links to add padding for self-collision
+        acm_links = ["link_tcp", "link_eef", "link_base", "left_inner_knuckle", "left_outer_knuckle",
+            "right_inner_knuckle", "right_outer_knuckle", "right_finger", "left_finger", "xarm_gripper_base_link"]
+        
+        # Add padding to all robot links
+        self.planning_scene.link_padding = []
+        for link_name in acm_links:
+            padding = LinkPadding()
+            padding.link_name = link_name
+            padding.padding = 0.05
+            self.planning_scene.link_padding.append(padding)
+            self.log_info(f"Added 0.05m padding to {link_name}")
+       
+        self.apply_planning_scene(self.planning_scene)
+        self.log_info("Planning scene with workspace boundaries has been set up.")
+
+    def create_box_collision_object(self, name, x_dim, y_dim, z_dim, x_pos, y_pos, z_pos):
+        """
+        Create a box collision object for the planning scene.
+        """
+        collision_object = CollisionObject()
+        collision_object.header.frame_id = "link_base"
+        collision_object.id = name
+        
+        # Define the box as a solid primitive
+        box = SolidPrimitive()
+        box.type = SolidPrimitive.BOX
+        box.dimensions = [x_dim, y_dim, z_dim]
+        
+        # Set the pose of the box
+        pose = PoseStamped()
+        pose.header.frame_id = "link_base"
+        pose.pose.position.x = x_pos
+        pose.pose.position.y = y_pos
+        pose.pose.position.z = z_pos
+        pose.pose.orientation.w = 1.0
+        
+        # Add the primitive to the collision object
+        collision_object.primitives.append(box)
+        collision_object.primitive_poses.append(pose.pose)
+        collision_object.operation = CollisionObject.ADD
+        
+        return collision_object
+
+    def apply_planning_scene(self, planning_scene):
+        """
+        Apply the planning scene through the proper service and publish updates.
+        """
+        # Make a copy to avoid modifying the original
+        scene_to_publish = PlanningScene()
+        scene_to_publish.is_diff = True
+        
+        # Only include what's changed
+        if hasattr(planning_scene, 'world') and planning_scene.world.collision_objects:
+            scene_to_publish.world.collision_objects = planning_scene.world.collision_objects
+        
+        if hasattr(planning_scene, 'robot_state') and planning_scene.robot_state.joint_state.name:
+            scene_to_publish.robot_state = planning_scene.robot_state
+        
+        if hasattr(planning_scene, 'link_padding') and planning_scene.link_padding:
+            scene_to_publish.link_padding = planning_scene.link_padding
+        
+        # Use the service for applying the scene
+        req = ApplyPlanningScene.Request()
+        req.scene = scene_to_publish
+        
+        future = self.apply_planning_scene_client.call_async(req)
+        future.add_done_callback(self.planning_scene_applied_callback)
+        
+        # Also publish to the planning_scene topic
+        self.planning_scene_pub.publish(scene_to_publish)
+
+    def planning_scene_applied_callback(self, future):
+        """
+        Callback for when the planning scene has been applied.
+        """
+        try:
+            response = future.result()
+            # if response.success:
+            #     self.log_info("Planning scene successfully applied") 
+            # else:
+            #     self.log_warn("Failed to apply planning scene")
+        except Exception as e:
+            self.log_error(f"Error applying planning scene: {e}")
 
     ####################################################################
     # LOGGING METHODS
@@ -144,54 +281,23 @@ class ME314_XArm_Queue_Commander(Node):
         self.get_logger().error(colored_message)
 
     ####################################################################
-    # BOUNDS CHECKING
-    ####################################################################
-    def is_pose_within_bounds(self, pose: Pose) -> bool:
-        """
-        Check if the given pose is within the manual bounding region in millimeters.
-        Return True if valid, False otherwise (and log a warning).
-        """
-        x_mm = pose.position.x * 1000
-        y_mm = pose.position.y * 1000
-        z_mm = pose.position.z * 1000
-
-        within_x = self.x_bounds[0] <= x_mm <= self.x_bounds[1]
-        within_y = self.y_bounds[0] <= y_mm <= self.y_bounds[1]
-        within_z = self.z_bounds[0] <= z_mm <= self.z_bounds[1]
-
-        if not (within_x and within_y and within_z):
-            reasons = []
-            if not within_x:
-                reasons.append(f"X ({x_mm:.1f}mm) outside [{self.x_bounds[0]}, {self.x_bounds[1]}]mm")
-            if not within_y:
-                reasons.append(f"Y ({y_mm:.1f}mm) outside [{self.y_bounds[0]}, {self.y_bounds[1]}]mm")
-            if not within_z:
-                reasons.append(f"Z ({z_mm:.1f}mm) outside [{self.z_bounds[0]}, {self.z_bounds[1]}]mm")
-
-            self.log_warn("POSE OUT OF BOUNDS: " + ", ".join(reasons))
-            rejected_msg = String()
-            rejected_msg.data = (
-                f"REJECTED: Pose [X={x_mm:.1f}, Y={y_mm:.1f}, Z={z_mm:.1f}]mm - " +
-                ", ".join(reasons)
-            )
-            self.rejected_command_pub.publish(rejected_msg)
-            self.rejected_commands_count += 1
-            return False
-        return True
-
-    ####################################################################
     # QUEUE METHODS
     ####################################################################
-    def init_done_callback(self, success: Bool):
+    def gripper_init_callback(self, success: Bool):
+        """
+        Callback invoked after the gripper initialization command is completed.
+        """
         if success:
             self.log_info("Initialization complete. Ready to process commands.")
             self.initialization_complete = True
-
         else:
             self.log_warn("Initialization failed. Gripper open command failed.")
             self.initialization_complete = True
 
     def command_queue_callback(self, msg: CommandQueue):
+        """
+        Process the incoming CommandQueue message and add each command to the internal queue.
+        """
         with self.queue_lock:
             for command in msg.commands:
                 if command.command_type == "pose":
@@ -204,20 +310,7 @@ class ME314_XArm_Queue_Commander(Node):
                     pose.orientation.y = pose_cmd.qy
                     pose.orientation.z = pose_cmd.qz
                     pose.orientation.w = pose_cmd.qw
-
-                    # Manual bounding check
-                    if self.is_pose_within_bounds(pose):
-                        self.command_queue.append(("pose", pose))
-                        self.log_info(
-                            f"Queued pose command: "
-                            f"[{pose.position.x:.3f}, {pose.position.y:.3f}, {pose.position.z:.3f}]"
-                        )
-                    else:
-                        self.log_warn(
-                            f"Rejected pose command: "
-                            f"[{pose.position.x:.3f}, {pose.position.y:.3f}, {pose.position.z:.3f}]"
-                            " - Outside workspace bounds"
-                        )
+                    self.command_queue.append(("pose", pose))
 
                 elif command.command_type == "gripper":
                     gripper_cmd = command.gripper_command
@@ -225,15 +318,10 @@ class ME314_XArm_Queue_Commander(Node):
                     self.log_info(f"Queued gripper command: {gripper_cmd.gripper_position}")
 
                 elif command.command_type == "joint":
-                    joint_cmd = command.joint_command
-                    joint_positions = [
-                        joint_cmd.joint1, joint_cmd.joint2, joint_cmd.joint3,
-                        joint_cmd.joint4, joint_cmd.joint5, joint_cmd.joint6, joint_cmd.joint7
-                    ]
-                    self.command_queue.append(("joint", joint_positions))
-                    self.log_info(
-                        f"Queued joint command: {[math.degrees(j) for j in joint_positions]}"
-                    )
+                    j = command.joint_command
+                    joint_pos = [j.joint1, j.joint2, j.joint3, j.joint4, j.joint5, j.joint6, j.joint7]
+                    self.command_queue.append(("joint", joint_pos))
+                    self.log_info(f"Queued joint command: {[math.degrees(j) for j in joint_pos]}")
 
                 elif command.command_type == "home":
                     self.command_queue.append(("home", None))
@@ -243,43 +331,41 @@ class ME314_XArm_Queue_Commander(Node):
 
             self.execution_condition.notify()
 
-        self.log_info(
-            f"Added {len(msg.commands)} commands to queue. Current queue size: {len(self.command_queue)}"
-        )
+        self.log_info(f"Added {len(msg.commands)} commands. Current queue size: {len(self.command_queue)}")
 
     def process_command_queue(self):
+        """
+        Check and process the next command in the queue if the system is not currently executing a command.
+        """
         if not self.initialization_complete:
+            return
+        
+        if self.command_failed:
             return
 
         with self.queue_lock:
             if not self.command_queue or self.is_executing:
                 return
 
-            command_type, command_data = self.command_queue[0]
+            cmd_type, cmd = self.command_queue[0]
             self.is_executing = True
 
-        if command_type == "pose":
-            self.log_info(
-                f"Executing pose command: "
-                f"[{command_data.position.x:.3f}, {command_data.position.y:.3f}, {command_data.position.z:.3f}]"
-            )
-            self.compute_ik_and_execute_joint_async(command_data, callback=self.command_execution_complete)
+        if cmd_type == "pose":
+            self.log_info(f"Executing pose command: [{cmd.position.x:.3f}, {cmd.position.y:.3f}, {cmd.position.z:.3f}]")
+            self.compute_ik_and_execute_joint_async(cmd, callback=self.command_execution_complete)
 
-        elif command_type == "gripper":
-            self.log_info(f"Executing gripper command: {command_data}")
-            self.plan_execute_gripper_async(command_data, callback=self.command_execution_complete)
+        elif cmd_type == "gripper":
+            self.log_info(f"Executing gripper command: {cmd}")
+            self.plan_execute_gripper_async(cmd, callback=self.command_execution_complete)
 
-        elif command_type == "joint":
-            self.log_info(
-                f"Executing joint command: {[math.degrees(j) for j in command_data]}"
-            )
-            self.plan_execute_joint_target_async(command_data, callback=self.command_execution_complete)
-
-        elif command_type == "home":
-            self.log_info("Executing home command")
-            self.plan_execute_joint_target_async(self.home_joints_rad, callback=self.command_execution_complete)
+        elif cmd_type == "joint":
+            self.log_info(f"Executing joint command: {[math.degrees(j) for j in cmd]}")
+            self.plan_execute_joint_target_async(cmd, callback=self.command_execution_complete)
 
     def command_execution_complete(self, success: bool):
+        """
+        Callback function to handle completion of a command execution. Remove the command from the queue if successful.
+        """
         with self.queue_lock:
             if success:
                 self.log_info("Command executed successfully")
@@ -287,25 +373,25 @@ class ME314_XArm_Queue_Commander(Node):
                     self.command_queue.popleft()
             else:
                 self.log_warn("Command execution failed")
+                self.command_failed = True
             self.is_executing = False
 
     def publish_queue_status(self):
+        """
+        Publish the current status of the command queue, execution state, and information about the active command.
+        """
         with self.queue_lock:
             queue_size = len(self.command_queue)
             is_executing = self.is_executing
-            current_command = ""
+            cmd = ""
             if queue_size > 0:
-                cmd_type, cmd_data = self.command_queue[0]
+                cmd_type, data = self.command_queue[0]
                 if cmd_type == "pose":
-                    current_command = (
-                        f"Pose: [{cmd_data.position.x:.3f}, {cmd_data.position.y:.3f}, {cmd_data.position.z:.3f}]"
-                    )
+                    cmd = (f"Pose: [{data.position.x:.3f}, {data.position.y:.3f}, {data.position.z:.3f}]")
                 elif cmd_type == "gripper":
-                    current_command = f"Gripper: {cmd_data}"
+                    cmd = f"Gripper: {data}"
                 elif cmd_type == "joint":
-                    current_command = f"Joint: {[math.degrees(j) for j in cmd_data]}"
-                elif cmd_type == "home":
-                    current_command = "Home"
+                    cmd = f"Joint: {[math.degrees(j) for j in data]}"
 
         queue_size_msg = Float64()
         queue_size_msg.data = float(queue_size)
@@ -316,13 +402,16 @@ class ME314_XArm_Queue_Commander(Node):
         self.is_executing_pub.publish(is_executing_msg)
 
         current_command_msg = String()
-        current_command_msg.data = current_command
+        current_command_msg.data = cmd
         self.current_command_pub.publish(current_command_msg)
 
     ####################################################################
     # CORE METHODS
     ####################################################################
     def wait_for_all_services_and_action(self):
+        """
+        Wait for all necessary services and action servers to become available before proceeding.
+        """
         while not self.cartesian_path_client.wait_for_service(timeout_sec=1.0):
             self.log_info('Waiting for compute_cartesian_path service...')
         while not self.compute_ik_client.wait_for_service(timeout_sec=1.0):
@@ -337,33 +426,65 @@ class ME314_XArm_Queue_Commander(Node):
         self.log_info('All services and action servers are available!')
 
     def home_move_done_callback(self, success: bool):
+        """
+        Callback for when the home position move is completed.
+        Sets up the planning scene if the move succeeded.
+        """
         if not success:
             self.log_warn("Failed to move to home position (joint-based).")
         else:
             self.log_info("Home position move completed successfully (joint-based).")
 
+            # Open the gripper fully after home position is reached
+            self.log_info("Opening gripper fully.")
+            self.plan_execute_gripper_async(0.0, callback=self.gripper_init_callback)
+
+            # Setup planning scene with workspace bounds now that the robot is at home
+            self.setup_planning_scene()
+
     def joint_state_callback(self, msg: JointState):
+        """
+        Callback for processing new joint state messages.
+        Updates the current joint positions and gripper state, and reapplies the planning scene.
+        """
         for name, position in zip(msg.name, msg.position):
             if name in self.joint_names:
                 i = self.joint_names.index(name)
-                self.current_joint_positions[i] = position
+                self.curr_joint_positions[i] = position
             if name == "xarm_gripper_drive_joint":
                 self.current_gripper_position = position
 
+        # If we have a complete joint state, republish it to update RViz visualization
+        if None not in self.curr_joint_positions and self.initialization_complete:
+            robot_state = RobotState()
+            robot_state.joint_state.name = self.joint_names.copy()
+            robot_state.joint_state.position = self.curr_joint_positions.copy()
+
+            # Set the robot state in the planning scene
+            self.planning_scene.robot_state = robot_state
+            self.planning_scene.is_diff = True
+            self.apply_planning_scene(self.planning_scene)
+
     def publish_current_joint_positions(self):
-        if None in self.current_joint_positions:
+        """
+        Publish the current joint positions (converted to degrees) to the relevant topic.
+        """
+        if None in self.curr_joint_positions:
             return
         msg = JointState()
         msg.name = self.joint_names
-        msg.position = [math.degrees(pos) for pos in self.current_joint_positions]
+        msg.position = [math.degrees(pos) for pos in self.curr_joint_positions]
         self.curr_joint_position_deg_pub.publish(msg)
 
     def publish_current_pose(self):
-        if None in self.current_joint_positions:
+        """
+        Compute and publish the current end-effector pose using forward kinematics.
+        """
+        if None in self.curr_joint_positions:
             return
         robot_state = RobotState()
         robot_state.joint_state.name = self.joint_names
-        robot_state.joint_state.position = self.current_joint_positions
+        robot_state.joint_state.position = self.curr_joint_positions
 
         req = GetPositionFK.Request()
         req.header.frame_id = "link_base"
@@ -374,6 +495,9 @@ class ME314_XArm_Queue_Commander(Node):
         future.add_done_callback(self.publish_current_pose_cb)
 
     def publish_current_pose_cb(self, future):
+        """
+        Callback function for handling the forward kinematics service response and publishing the pose.
+        """
         try:
             res = future.result()
             if res is not None and len(res.pose_stamped) > 0:
@@ -383,6 +507,9 @@ class ME314_XArm_Queue_Commander(Node):
             self.log_error(f"FK service call failed: {e}")
 
     def publish_gripper_position(self):
+        """
+        Publish the current gripper position to the relevant topic.
+        """
         if self.current_gripper_position is None:
             return
         msg = Float64()
@@ -390,6 +517,9 @@ class ME314_XArm_Queue_Commander(Node):
         self.gripper_position_pub.publish(msg)
 
     def compute_ik_and_execute_joint_async(self, target_pose: Pose, callback=None):
+        """
+        Compute inverse kinematics for the given target pose and execute the resulting joint trajectory asynchronously.
+        """
         # For real hardware, apply an additional +0.058m offset to Z
         if not self.use_sim:
             self.log_info("Applying +0.058 m offset in Z because use_sim=False")
@@ -402,13 +532,14 @@ class ME314_XArm_Queue_Commander(Node):
         ik_req.ik_request.pose_stamped.pose = target_pose
         ik_req.ik_request.timeout.sec = 2
 
-        ik_req.ik_request.avoid_collisions = False
-
-        # No collision checking with bounding boxes; we do manual checks
         future_ik = self.compute_ik_client.call_async(ik_req)
         future_ik.add_done_callback(lambda f: self.compute_ik_done_cb(f, callback))
 
     def compute_ik_done_cb(self, future, callback=None):
+        """
+        Callback for processing the inverse kinematics result.
+        Executes a joint motion if the IK solution is valid.
+        """
         try:
             res = future.result()
         except Exception as e:
@@ -434,6 +565,9 @@ class ME314_XArm_Queue_Commander(Node):
         self.plan_execute_joint_target_async(desired_positions, callback=callback)
 
     def plan_execute_joint_target_async(self, joint_positions, callback=None):
+        """
+        Plan and execute a joint trajectory asynchronously to move the robot to the specified joint positions.
+        """
         req = GetMotionPlan.Request()
         motion_req = MotionPlanRequest()
         motion_req.workspace_parameters.header.frame_id = "link_base"
@@ -449,12 +583,13 @@ class ME314_XArm_Queue_Commander(Node):
             constraint.tolerance_below = 0.01
             constraint.weight = 1.0
             motion_req.goal_constraints[0].joint_constraints.append(constraint)
-
+        
         motion_req.group_name = "xarm7"
         motion_req.num_planning_attempts = 10
         motion_req.allowed_planning_time = 5.0
         motion_req.path_constraints.name = "disable_collisions"
 
+        # Adjust arm movement speed based on sim vs real
         if self.use_sim:
             motion_req.max_velocity_scaling_factor = 0.2
             motion_req.max_acceleration_scaling_factor = 0.2
@@ -471,6 +606,9 @@ class ME314_XArm_Queue_Commander(Node):
         future.add_done_callback(lambda f: self.plan_path_done_cb(f, callback))
 
     def plan_path_done_cb(self, future, callback):
+        """
+        Callback function to handle the result of joint path planning and initiate trajectory execution.
+        """
         try:
             result = future.result()
         except Exception as e:
@@ -491,6 +629,9 @@ class ME314_XArm_Queue_Commander(Node):
         self.execute_trajectory_async(result.motion_plan_response.trajectory, callback)
 
     def execute_trajectory_async(self, trajectory: RobotTrajectory, callback=None):
+        """
+        Execute a planned trajectory asynchronously using the ExecuteTrajectory action server.
+        """
         goal_msg = ExecuteTrajectory.Goal()
         goal_msg.trajectory = trajectory
 
@@ -499,6 +640,9 @@ class ME314_XArm_Queue_Commander(Node):
         send_goal_future.add_done_callback(lambda f: self.action_server_send_callback(f, callback))
 
     def action_server_send_callback(self, future, callback):
+        """
+        Callback for handling the response after sending a trajectory goal to the action server.
+        """
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.log_error("ExecuteTrajectory goal was rejected by server.")
@@ -511,6 +655,9 @@ class ME314_XArm_Queue_Commander(Node):
         result_future.add_done_callback(lambda f: self.action_server_execute_callback(f, callback))
 
     def action_server_execute_callback(self, future, callback):
+        """
+        Callback function for processing the trajectory execution result from the action server.
+        """
         result = future.result().result
         if result.error_code.val != 1:
             self.log_error(f"Trajectory execution failed with error code: {result.error_code.val}")
@@ -523,6 +670,9 @@ class ME314_XArm_Queue_Commander(Node):
             callback(True)
 
     def plan_execute_gripper_async(self, position: float, callback=None):
+        """
+        Plan and execute a gripper motion asynchronously to move the gripper to the specified position.
+        """
         req = GetMotionPlan.Request()
         motion_req = MotionPlanRequest()
         motion_req.workspace_parameters.header.frame_id = "link_base"
@@ -534,8 +684,8 @@ class ME314_XArm_Queue_Commander(Node):
             constraint = JointConstraint()
             constraint.joint_name = jn
             constraint.position = position
-            constraint.tolerance_above = 0.01
-            constraint.tolerance_below = 0.01
+            constraint.tolerance_above = 2.0
+            constraint.tolerance_below = 2.0
             constraint.weight = 1.0
             motion_req.goal_constraints[0].joint_constraints.append(constraint)
 
@@ -547,13 +697,16 @@ class ME314_XArm_Queue_Commander(Node):
 
         req.motion_plan_request = motion_req
 
-        self.log_info(f"Planning gripper motion to {math.degrees(position):.2f} deg")
+        self.log_info(f"Planning gripper motion to {math.degrees(position):.2f}")
 
         future = self.plan_path_client.call_async(req)
         future.add_done_callback(lambda f: self.plan_path_done_cb(f, callback))
 
 
 def main(args=None):
+    """
+    Main function to initialize and run the ME314_XArm_Queue_Commander node.
+    """
     rclpy.init(args=args)
     commander = ME314_XArm_Queue_Commander()
 

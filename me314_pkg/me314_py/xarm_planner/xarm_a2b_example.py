@@ -3,9 +3,7 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Pose
-import time
 from std_msgs.msg import Float64
-import numpy as np
 
 # Import the command queue message types from the reference code
 from me314_msgs.msg import CommandQueue, CommandWrapper
@@ -91,7 +89,7 @@ def main(args=None):
 
     # Define poses using the array format [x, y, z, qx, qy, qz, qw]
     p0 = [0.3408, 0.0021, 0.3029, 1.0, 0.0, 0.0, 0.0]
-    p1 = [p0[0], p0[1], 0.0, 1.0, 0.0, 0.0, 0.0]
+    p1 = [p0[0], p0[1], 0.1, 1.0, 0.0, 0.0, 0.0]
 
     poses = [p0, p1]
 
