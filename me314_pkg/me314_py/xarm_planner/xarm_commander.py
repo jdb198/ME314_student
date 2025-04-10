@@ -77,14 +77,13 @@ class ME314_XArm_Queue_Commander(Node):
         self.log_info(f"Running with use_sim={self.use_sim}")
 
         self.current_gripper_position = 0.0
-        self.home_joints_deg = [1.1, -48.5, 0.4, 32.8, 0.4, 81.9, 0.3]
+        self.home_joints_deg = [0.2, -67.2, -0.2, 24.2, 0.4, 91.4, 0.3]
         self.home_joints_rad = [math.radians(angle) for angle in self.home_joints_deg]
         self.joint_names = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'joint7']
         self.curr_joint_positions = [None] * len(self.joint_names)
 
         self.gripper_group_name = "xarm_gripper"  
-        self.gripper_joint_names = ["drive_joint"]  # Matches your MoveIt gripper config
-
+        self.gripper_joint_names = ["drive_joint"]
         self.initialization_complete = False
         self.command_failed = False
 
@@ -92,7 +91,7 @@ class ME314_XArm_Queue_Commander(Node):
         self.x_bounds = (150, 500)   
         self.y_bounds = (-300, 300) 
         if self.use_sim:
-            self.z_bounds = (10, 400) 
+            self.z_bounds = (0, 400) 
         else:
             self.z_bounds = (35, 400)
 
@@ -164,12 +163,12 @@ class ME314_XArm_Queue_Commander(Node):
         # Create collision objects for the 5 planes of the box (open top)
         collision_objects = []
         
-        # Front wall (max X)
-        collision_objects.append(self.create_box_collision_object("front_wall", 0.01, y_w, 0.6, x_u + 0.005, y_c, 0.25 + z_l))
-        collision_objects.append(self.create_box_collision_object("back_wall", 0.01, y_w, 0.6, x_l - 0.5, y_c, 0.25 + z_l))
-        collision_objects.append(self.create_box_collision_object("left_wall", x_w, 0.01, 0.6, x_c, y_l - 0.005, 0.25 + z_l))
-        collision_objects.append(self.create_box_collision_object("right_wall", x_w, 0.01, 0.6, x_c, y_u + 0.005, 0.25 + z_l))
-        collision_objects.append(self.create_box_collision_object("floor", x_w, y_w, 0.01, x_c, y_c, z_l - 0.005))
+        # (From robot's perspective))
+        collision_objects.append(self.create_box_collision_object("front_wall", 0.001, y_w, 0.6, x_u + 0.005, y_c, 0.25 + z_l))
+        collision_objects.append(self.create_box_collision_object("back_wall", 0.001, y_w, 0.6, x_l - 0.5, y_c, 0.25 + z_l))
+        collision_objects.append(self.create_box_collision_object("right_wall", x_w, 0.001, 0.6, x_c, y_l - 0.05, 0.25 + z_l))
+        collision_objects.append(self.create_box_collision_object("left_wall", x_w, 0.001, 0.6, x_c, y_u + 0.025, 0.25 + z_l))
+        collision_objects.append(self.create_box_collision_object("floor", x_w, y_w, 0.001, x_c, y_c, z_l - 0.005))
         
         # Store our boundary collision objects in class attribute
         self.boundary_collision_objects = collision_objects
@@ -186,9 +185,9 @@ class ME314_XArm_Queue_Commander(Node):
         for link_name in acm_links:
             padding = LinkPadding()
             padding.link_name = link_name
-            padding.padding = 0.05
+            padding.padding = 0.002
             self.planning_scene.link_padding.append(padding)
-            self.log_info(f"Added 0.05m padding to {link_name}")
+            self.log_info(f"Added 0.002m padding to {link_name}")
        
         self.apply_planning_scene(self.planning_scene)
         self.log_info("Planning scene with workspace boundaries has been set up.")
@@ -681,8 +680,8 @@ class ME314_XArm_Queue_Commander(Node):
             constraint = JointConstraint()
             constraint.joint_name = jn
             constraint.position = position
-            constraint.tolerance_above = 2.0
-            constraint.tolerance_below = 2.0
+            constraint.tolerance_above = 0.02
+            constraint.tolerance_below = 0.02
             constraint.weight = 1.0
             motion_req.goal_constraints[0].joint_constraints.append(constraint)
 

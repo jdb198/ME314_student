@@ -41,7 +41,7 @@ def generate_launch_description():
                     'gazebo_models', 'red_block.sdf'
                 ),
                 '-entity', 'block',
-                '-x', '0', '-y', '-1', '-z', '1.021'
+                '-x', '-0.1', '-y', '-0.85', '-z', '1.021'
             ],
             parameters=[{'use_sim_time': True}],
         )]
