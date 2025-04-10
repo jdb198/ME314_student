@@ -245,9 +245,6 @@ class ME314_XArm_Queue_Commander(Node):
         
         future = self.apply_planning_scene_client.call_async(req)
         future.add_done_callback(self.planning_scene_applied_callback)
-        
-        # Also publish to the planning_scene topic
-        self.planning_scene_pub.publish(scene_to_publish)
 
     def planning_scene_applied_callback(self, future):
         """
