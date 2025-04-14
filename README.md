@@ -148,7 +148,7 @@ mkdir -p xarm_ros2_ws/src
 
 ```bash
 cd ~/xarm_ros2_ws/src
-git clone https://github.com/RealSoloQ/xarm_ros2.git --recursive -b $ROS_DISTRO
+git clone https://github.com/Realexqiu/xarm_ros2.git --recursive -b $ROS_DISTRO
 rosdep update && rosdep install --from-paths . --ignore-src --rosdistro $ROS_DISTRO -y --skip-keys="roscpp catkin"
 cd ~/xarm_ros2_ws
 colcon build

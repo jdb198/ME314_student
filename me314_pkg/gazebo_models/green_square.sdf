@@ -1,0 +1,37 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="square">
+    <static>true</static>
+    <link name="link">
+      <visual name="visual">
+        <geometry>
+          <box>
+            <size>0.1 0.1 0.001</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0 1 0 1</ambient>
+          <diffuse>0 1 0 1</diffuse>
+        </material>
+      </visual>
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>0.1 0.1 0.001</size>
+          </box>
+        </geometry>
+      </collision>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>2.15e-05</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>2.15e-05</iyy>
+          <iyz>0</iyz>
+          <izz>2.15e-05</izz>
+        </inertia>
+      </inertial>
+    </link>
+  </model>
+</sdf>
