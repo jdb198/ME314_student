@@ -9,12 +9,14 @@ The node only moves to the next command after the current one is fully completed
 import rclpy
 import math
 import threading
+import time
 from collections import deque
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from geometry_msgs.msg import Pose, PoseStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String, Bool
+from xarm_msgs.srv import SetInt16, Call
 
 # Custom message type for command queue (which contains an array of CommandWrapper messages)
 from me314_msgs.msg import CommandQueue
@@ -33,6 +35,7 @@ from moveit_msgs.srv import GetPlanningScene, ApplyPlanningScene
 from shape_msgs.msg import SolidPrimitive
 from moveit_msgs.msg import CollisionObject
 from moveit_msgs.action import ExecuteTrajectory
+from rclpy import spin_until_future_complete
 
 
 class ME314_XArm_Queue_Commander(Node):
@@ -56,18 +59,6 @@ class ME314_XArm_Queue_Commander(Node):
         self.queue_lock = threading.Lock()
         self.is_executing = False
         self.execution_condition = threading.Condition(self.queue_lock)
-
-        ####################################################################
-        # CLIENTS
-        ####################################################################
-        self.cartesian_path_client = self.create_client(GetCartesianPath, '/compute_cartesian_path')
-        self.compute_ik_client = self.create_client(GetPositionIK, '/compute_ik')
-        self.plan_path_client = self.create_client(GetMotionPlan, '/plan_kinematic_path')
-        self.fk_client = self.create_client(GetPositionFK, '/compute_fk')
-        self.execute_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
-        self.get_planning_scene_client = self.create_client(GetPlanningScene, '/get_planning_scene')
-        self.apply_planning_scene_client = self.create_client(ApplyPlanningScene, '/apply_planning_scene')
-        self.wait_for_all_services_and_action()
 
         ####################################################################
         # CLASS ATTRIBUTES
@@ -101,6 +92,24 @@ class ME314_XArm_Queue_Commander(Node):
         self.planning_scene.robot_state.is_diff = True    
 
         ####################################################################
+        # CLIENTS
+        ####################################################################
+        self.cartesian_path_client = self.create_client(GetCartesianPath, '/compute_cartesian_path')
+        self.compute_ik_client = self.create_client(GetPositionIK, '/compute_ik')
+        self.plan_path_client = self.create_client(GetMotionPlan, '/plan_kinematic_path')
+        self.fk_client = self.create_client(GetPositionFK, '/compute_fk')
+        self.execute_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
+        self.get_plan_scene_client = self.create_client(GetPlanningScene, '/get_planning_scene')
+        self.apply_plan_scene_client = self.create_client(ApplyPlanningScene, '/apply_planning_scene')
+        
+        if not self.use_sim:
+            self.enable_FT_client = self.create_client(SetInt16, '/xarm/ft_sensor_enable')
+            self.zero_FT_client = self.create_client(Call, '/xarm/ft_sensor_set_zero')
+            self.set_arm_state_client = self.create_client(SetInt16, '/xarm/set_state')
+
+        self.wait_for_all_services_and_action()
+
+        ####################################################################
         # SUBSCRIBERS
         ####################################################################
         self.queue_cmd_sub = self.create_subscription(CommandQueue, '/me314_xarm_command_queue', self.command_queue_callback, 10)
@@ -120,12 +129,11 @@ class ME314_XArm_Queue_Commander(Node):
         self.rejected_command_pub = self.create_publisher(String, '/me314_xarm_rejected_command', 10)
 
         # Timers for status publishing and processing the queue
-        self.timer_period = 0.1  # seconds
-        self.timer_pose = self.create_timer(self.timer_period, self.publish_current_pose)
-        self.timer_gripper = self.create_timer(self.timer_period, self.publish_gripper_position)
-        self.timer_joint_positions = self.create_timer(self.timer_period, self.publish_current_joint_positions)
-        self.timer_queue_status = self.create_timer(self.timer_period, self.publish_queue_status)
-        self.timer_queue_processor = self.create_timer(self.timer_period, self.process_command_queue)
+        self.timer_pose = self.create_timer(0.1, self.publish_current_pose)
+        self.timer_gripper = self.create_timer(0.1, self.publish_gripper_position)
+        self.timer_joint_positions = self.create_timer(0.1, self.publish_current_joint_positions)
+        self.timer_queue_status = self.create_timer(0.1, self.publish_queue_status)
+        self.timer_queue_processor = self.create_timer(0.1, self.process_command_queue)
 
         ####################################################################
         # INITIALIZATION
@@ -139,6 +147,35 @@ class ME314_XArm_Queue_Commander(Node):
 
         # Store collision objects here so we can reapply them in each planning scene update
         self.boundary_collision_objects = []
+
+    def init_ft_sensor(self):
+        """
+        Initialize the force/torque sensor by enabling it, zeroing it, and clearing any errors.
+        """
+        self.call_service(self.enable_FT_client, SetInt16.Request(data=1), "FT sensor enabled successfully!", "FT enable")
+        self.call_service(self.zero_FT_client, Call.Request(), "FT sensor zeroed successfully!", "FT zero")
+        self.call_service(self.set_arm_state_client, SetInt16.Request(data=0), "Robot state set to READY successfully 🎉", "Set state")
+
+    def call_service(self, client, request, success_msg, name, pre_delay=0):
+        """
+        Call a service and handle the response.
+        """
+        if pre_delay > 0:
+            time.sleep(pre_delay)
+        
+        if not client.wait_for_service(5.0):
+            self.log_error(f"{name} service unavailable")
+            return
+            
+        fut = client.call_async(request)
+        spin_until_future_complete(self, fut, timeout_sec=2.0)
+        
+        if not fut.done() or fut.result() is None:
+            self.log_error(f"{name} call timed out")
+        elif fut.result().ret != 0:
+            self.log_error(f"{name} failed: {fut.result().message}")
+        else:
+            self.log_info(success_msg)
 
     ####################################################################
     # PLANNING SCENE METHODS
@@ -155,10 +192,8 @@ class ME314_XArm_Queue_Commander(Node):
         y_l, y_u = self.y_bounds[0] / 1000.0, self.y_bounds[1] / 1000.0
         z_l = self.z_bounds[0] / 1000.0
 
-        x_c = (x_l + x_u) / 2.0
-        y_c = (y_l + y_u) / 2.0
-        x_w = (x_u - x_l) + 0.1 
-        y_w = (y_u - y_l) + 0.1 
+        x_c, y_c = (x_l + x_u) / 2.0, (y_l + y_u) / 2.0
+        x_w, y_w = (x_u - x_l) + 0.1, (y_u - y_l) + 0.1 
         
         # Create collision objects for the 5 planes of the box (open top)
         collision_objects = []
@@ -242,7 +277,7 @@ class ME314_XArm_Queue_Commander(Node):
         req = ApplyPlanningScene.Request()
         req.scene = scene_to_publish
         
-        future = self.apply_planning_scene_client.call_async(req)
+        future = self.apply_plan_scene_client.call_async(req)
         future.add_done_callback(self.planning_scene_applied_callback)
 
     def planning_scene_applied_callback(self, future):
@@ -251,10 +286,6 @@ class ME314_XArm_Queue_Commander(Node):
         """
         try:
             response = future.result()
-            # if response.success:
-            #     self.log_info("Planning scene successfully applied") 
-            # else:
-            #     self.log_warn("Failed to apply planning scene")
         except Exception as e:
             self.log_error(f"Error applying planning scene: {e}")
 
@@ -333,10 +364,7 @@ class ME314_XArm_Queue_Commander(Node):
         """
         Check and process the next command in the queue if the system is not currently executing a command.
         """
-        if not self.initialization_complete:
-            return
-        
-        if self.command_failed:
+        if not self.initialization_complete or self.command_failed:
             return
 
         with self.queue_lock:
@@ -350,13 +378,13 @@ class ME314_XArm_Queue_Commander(Node):
             self.log_info(f"Executing pose command: [{cmd.position.x:.3f}, {cmd.position.y:.3f}, {cmd.position.z:.3f}]")
             self.compute_ik_and_execute_joint_async(cmd, callback=self.command_execution_complete)
 
-        elif cmd_type == "gripper":
-            self.log_info(f"Executing gripper command: {cmd}")
-            self.plan_execute_gripper_async(cmd, callback=self.command_execution_complete)
-
         elif cmd_type == "joint":
             self.log_info(f"Executing joint command: {[math.degrees(j) for j in cmd]}")
             self.plan_execute_joint_target_async(cmd, callback=self.command_execution_complete)
+
+        elif cmd_type == "gripper":
+            self.log_info(f"Executing gripper command: {cmd}")
+            self.plan_execute_gripper_async(cmd, callback=self.command_execution_complete)
 
     def command_execution_complete(self, success: bool):
         """
@@ -405,20 +433,30 @@ class ME314_XArm_Queue_Commander(Node):
     # CORE METHODS
     ####################################################################
     def wait_for_all_services_and_action(self):
-        """
-        Wait for all necessary services and action servers to become available before proceeding.
-        """
-        while not self.cartesian_path_client.wait_for_service(timeout_sec=1.0):
-            self.log_info('Waiting for compute_cartesian_path service...')
-        while not self.compute_ik_client.wait_for_service(timeout_sec=1.0):
-            self.log_info('Waiting for compute_ik service...')
-        while not self.plan_path_client.wait_for_service(timeout_sec=1.0):
-            self.log_info('Waiting for plan_kinematic_path service...')
+        """Wait for all services and action servers to become available."""
+        services = [
+            (self.cartesian_path_client, 'compute_cartesian_path'),
+            (self.compute_ik_client, 'compute_ik'),
+            (self.plan_path_client, 'plan_kinematic_path'),
+            (self.fk_client, 'compute_fk'),
+            (self.get_plan_scene_client, 'get_planning_scene'),
+            (self.apply_plan_scene_client, 'apply_planning_scene'),
+        ]
+        
+        if not self.use_sim:
+            services.extend([
+                (self.enable_FT_client, 'xarm/ft_sensor_enable'),
+                (self.zero_FT_client, 'xarm/ft_sensor_set_zero'),
+                (self.set_arm_state_client, 'xarm/set_state')
+            ])
+        
+        for client, name in services:
+            while not client.wait_for_service(timeout_sec=1.0):
+                self.log_info(f'Waiting for {name} service...')
+                
         while not self.execute_client.wait_for_server(timeout_sec=1.0):
             self.log_info('Waiting for execute_trajectory action server...')
-        while not self.fk_client.wait_for_service(timeout_sec=1.0):
-            self.log_info('Waiting for compute_fk service...')
-
+            
         self.log_info('All services and action servers are available!')
 
     def home_move_done_callback(self, success: bool):
@@ -434,6 +472,10 @@ class ME314_XArm_Queue_Commander(Node):
             # Open the gripper fully after home position is reached
             self.log_info("Opening gripper fully.")
             self.plan_execute_gripper_async(0.0, callback=self.gripper_init_callback)
+            if not self.use_sim:
+                # Initialize the force/torque sensor
+                self.log_info("Initializing force/torque sensor.")
+                self.init_ft_sensor()
 
             # Setup planning scene with workspace bounds now that the robot is at home
             self.setup_planning_scene()
@@ -560,7 +602,7 @@ class ME314_XArm_Queue_Commander(Node):
         self.log_info("IK succeeded; now planning joint motion to that IK solution.")
         self.plan_execute_joint_target_async(desired_positions, callback=callback)
 
-    def plan_execute_joint_target_async(self, joint_positions, callback=None):
+    def plan_execute_joint_target_async(self, j_pos, callback=None):
         """
         Plan and execute a joint trajectory asynchronously to move the robot to the specified joint positions.
         """
@@ -569,35 +611,35 @@ class ME314_XArm_Queue_Commander(Node):
         motion_req.workspace_parameters.header.frame_id = "link_base"
         motion_req.workspace_parameters.header.stamp = self.get_clock().now().to_msg()
         motion_req.start_state.is_diff = True
-        motion_req.goal_constraints.append(Constraints())
 
+        # Create joint constraints for all joints
+        c = Constraints()
+        motion_req.goal_constraints.append(c)
+        
+        # Create constraints with named parameters instead of positional arguments
         for i, joint_name in enumerate(self.joint_names):
             constraint = JointConstraint()
             constraint.joint_name = joint_name
-            constraint.position = joint_positions[i]
+            constraint.position = j_pos[i]
             constraint.tolerance_above = 0.01
             constraint.tolerance_below = 0.01
             constraint.weight = 1.0
-            motion_req.goal_constraints[0].joint_constraints.append(constraint)
-        
+            c.joint_constraints.append(constraint)
+            
         motion_req.group_name = "xarm7"
         motion_req.num_planning_attempts = 10
         motion_req.allowed_planning_time = 5.0
         motion_req.path_constraints.name = "disable_collisions"
-
-        # Adjust arm movement speed based on sim vs real
         if self.use_sim:
-            motion_req.max_velocity_scaling_factor = 0.2
-            motion_req.max_acceleration_scaling_factor = 0.2
+            motion_req.max_velocity_scaling_factor = 0.25
+            motion_req.max_acceleration_scaling_factor = 0.25 
         else:
-            motion_req.max_velocity_scaling_factor = 0.08
-            motion_req.max_acceleration_scaling_factor = 0.08
+            motion_req.max_velocity_scaling_factor = 0.04
+            motion_req.max_acceleration_scaling_factor = 0.04
 
         req.motion_plan_request = motion_req
 
-        pos_deg = [math.degrees(a) for a in joint_positions]
-        self.log_info(f'Planning joint motion to positions (deg): {pos_deg}')
-
+        self.log_info(f'Planning joint motion to positions (deg): {[math.degrees(a) for a in j_pos]}')
         future = self.plan_path_client.call_async(req)
         future.add_done_callback(lambda f: self.plan_path_done_cb(f, callback))
 
@@ -614,9 +656,7 @@ class ME314_XArm_Queue_Commander(Node):
             return
 
         if result.motion_plan_response.error_code.val != 1:
-            self.log_error(
-                f"Planning failed, error code = {result.motion_plan_response.error_code.val}"
-            )
+            self.log_error(f"Planning failed, error code = {result.motion_plan_response.error_code.val}")
             if callback:
                 callback(False)
             return
@@ -674,17 +714,21 @@ class ME314_XArm_Queue_Commander(Node):
         motion_req.workspace_parameters.header.frame_id = "link_base"
         motion_req.workspace_parameters.header.stamp = self.get_clock().now().to_msg()
         motion_req.start_state.is_diff = True
-        motion_req.goal_constraints.append(Constraints())
-
+        
+        # Create joint constraints for gripper
+        c = Constraints()
+        motion_req.goal_constraints.append(c)
+        
+        # Add constraints with explicit attributes
         for jn in self.gripper_joint_names:
             constraint = JointConstraint()
             constraint.joint_name = jn
             constraint.position = position
-            constraint.tolerance_above = 0.02
-            constraint.tolerance_below = 0.02
+            constraint.tolerance_above = 0.01
+            constraint.tolerance_below = 0.01
             constraint.weight = 1.0
-            motion_req.goal_constraints[0].joint_constraints.append(constraint)
-
+            c.joint_constraints.append(constraint)
+        
         motion_req.group_name = self.gripper_group_name
         motion_req.num_planning_attempts = 10
         motion_req.allowed_planning_time = 5.0
@@ -694,7 +738,6 @@ class ME314_XArm_Queue_Commander(Node):
         req.motion_plan_request = motion_req
 
         self.log_info(f"Planning gripper motion to {math.degrees(position):.2f}")
-
         future = self.plan_path_client.call_async(req)
         future.add_done_callback(lambda f: self.plan_path_done_cb(f, callback))
 

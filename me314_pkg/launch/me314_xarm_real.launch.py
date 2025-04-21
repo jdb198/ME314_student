@@ -33,7 +33,8 @@ def generate_launch_description():
             'add_gripper': 'true',
             'add_realsense_d435i': 'true',
             'hw_ns': 'xarm',
-            'no_gui_ctrl': 'false'
+            'no_gui_ctrl': 'false',
+            'report_type': 'rich'
         }.items()
     )
     
