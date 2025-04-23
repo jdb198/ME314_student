@@ -13,10 +13,10 @@ import time
 from collections import deque
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from geometry_msgs.msg import Pose, PoseStamped
+from geometry_msgs.msg import Pose, PoseStamped, WrenchStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String, Bool
-from xarm_msgs.srv import SetInt16, SetFloat32List, Call
+from xarm_msgs.srv import SetInt16, Call
 
 # Custom message type for command queue (which contains an array of CommandWrapper messages)
 from me314_msgs.msg import CommandQueue
@@ -33,6 +33,7 @@ from moveit_msgs.msg import (
 )
 from moveit_msgs.srv import GetPlanningScene, ApplyPlanningScene
 from shape_msgs.msg import SolidPrimitive
+from control_msgs.action import FollowJointTrajectory
 from moveit_msgs.msg import CollisionObject
 from moveit_msgs.action import ExecuteTrajectory
 from rclpy import spin_until_future_complete
@@ -58,7 +59,6 @@ class ME314_XArm_Queue_Commander(Node):
         self.command_queue = deque()
         self.queue_lock = threading.Lock()
         self.is_executing = False
-        self.execution_condition = threading.Condition(self.queue_lock)
 
         ####################################################################
         # CLASS ATTRIBUTES
@@ -66,6 +66,11 @@ class ME314_XArm_Queue_Commander(Node):
         self.declare_parameter('use_sim', False)
         self.use_sim = self.get_parameter('use_sim').value
         self.log_info(f"Running with use_sim={self.use_sim}")
+
+        self.declare_parameter('ft_threshold', 2.0)
+        self.ft_threshold = self.get_parameter('ft_threshold').value
+        self.last_ext_force_mag = 0.0
+        self.controller_goal_handle = None
 
         self.current_gripper_position = 0.0
         self.home_joints_deg = [0.2, -67.2, -0.2, 24.2, 0.4, 91.4, 0.3]
@@ -99,6 +104,7 @@ class ME314_XArm_Queue_Commander(Node):
         self.plan_path_client = self.create_client(GetMotionPlan, '/plan_kinematic_path')
         self.fk_client = self.create_client(GetPositionFK, '/compute_fk')
         self.execute_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
+        self.arm_ctrl_client = ActionClient(self, FollowJointTrajectory, '/xarm7_traj_controller/follow_joint_trajectory')
         self.get_plan_scene_client = self.create_client(GetPlanningScene, '/get_planning_scene')
         self.apply_plan_scene_client = self.create_client(ApplyPlanningScene, '/apply_planning_scene')
         
@@ -114,6 +120,7 @@ class ME314_XArm_Queue_Commander(Node):
         ####################################################################
         self.queue_cmd_sub = self.create_subscription(CommandQueue, '/me314_xarm_command_queue', self.command_queue_callback, 10)
         self.joint_state_sub = self.create_subscription(JointState, '/joint_states', self.joint_state_callback, 10)
+        self.ft_sub = self.create_subscription(WrenchStamped, '/xarm/uf_ftsensor_ext_states', self.ft_sensor_callback, 50)
 
         ####################################################################
         # PUBLISHERS
@@ -121,12 +128,12 @@ class ME314_XArm_Queue_Commander(Node):
         self.current_pose_pub = self.create_publisher(Pose, '/me314_xarm_current_pose', 10)
         self.curr_joint_position_deg_pub = self.create_publisher(JointState, '/me314_xarm_current_joint_positions_deg', 10)
         self.gripper_position_pub = self.create_publisher(Float64, '/me314_xarm_gripper_position', 10)
-        self.complete_joint_state_pub = self.create_publisher(JointState, '/xarm_complete_joint_states', 10)
 
         self.queue_size_pub = self.create_publisher(Float64, '/me314_xarm_queue_size', 10)
         self.is_executing_pub = self.create_publisher(Bool, '/me314_xarm_is_executing', 10)
         self.current_command_pub = self.create_publisher(String, '/me314_xarm_current_command', 10)
         self.rejected_command_pub = self.create_publisher(String, '/me314_xarm_rejected_command', 10)
+        self.collision_pub = self.create_publisher(Bool, '/me314_xarm_collision', 10)
 
         # Timers for status publishing and processing the queue
         self.timer_pose = self.create_timer(0.1, self.publish_current_pose)
@@ -134,6 +141,7 @@ class ME314_XArm_Queue_Commander(Node):
         self.timer_joint_positions = self.create_timer(0.1, self.publish_current_joint_positions)
         self.timer_queue_status = self.create_timer(0.1, self.publish_queue_status)
         self.timer_queue_processor = self.create_timer(0.1, self.process_command_queue)
+        self.ft_timer = self.create_timer(0.01, self.check_ft_threshold)
 
         ####################################################################
         # INITIALIZATION
@@ -147,6 +155,8 @@ class ME314_XArm_Queue_Commander(Node):
 
         # Store collision objects here so we can reapply them in each planning scene update
         self.boundary_collision_objects = []
+
+        self.publish_collision_status(False)
 
     ####################################################################
     # INITIALIZATION METHODS
@@ -199,7 +209,7 @@ class ME314_XArm_Queue_Commander(Node):
             (self.plan_path_client, 'plan_kinematic_path'),
             (self.fk_client, 'compute_fk'),
             (self.get_plan_scene_client, 'get_planning_scene'),
-            (self.apply_plan_scene_client, 'apply_planning_scene'),
+            (self.apply_plan_scene_client, 'apply_planning_scene')
         ]
         
         if not self.use_sim:
@@ -213,8 +223,16 @@ class ME314_XArm_Queue_Commander(Node):
             while not client.wait_for_service(timeout_sec=1.0):
                 self.log_info(f'Waiting for {name} service...')
                 
-        while not self.execute_client.wait_for_server(timeout_sec=1.0):
-            self.log_info('Waiting for execute_trajectory action server...')
+        # Action clients        
+        action_clients = [
+            (self.execute_client, 'execute_trajectory'),
+            (self.arm_ctrl_client, 'follow_joint_trajectory')
+        ]
+        
+        # Wait for action clients
+        for client, name in action_clients:
+            while not client.wait_for_server(timeout_sec=1.0):
+                self.log_info(f'Waiting for {name} action server...')
             
         self.log_info('All services and action servers are available!')
 
@@ -279,13 +297,8 @@ class ME314_XArm_Queue_Commander(Node):
             "right_inner_knuckle", "right_outer_knuckle", "right_finger", "left_finger", "xarm_gripper_base_link", "ft_sensor_link", "link7"]
         
         # Add padding to all robot links
-        self.planning_scene.link_padding = []
-        for link_name in acm_links:
-            padding = LinkPadding()
-            padding.link_name = link_name
-            padding.padding = 0.002
-            self.planning_scene.link_padding.append(padding)
-            self.log_info(f"Added 0.002m padding to {link_name}")
+        self.planning_scene.link_padding = [LinkPadding(link_name=name, padding=0.002) for name in acm_links]
+        self.log_info("Added link padding to robot links for self-collision avoidance.")
        
         self.apply_planning_scene(self.planning_scene)
         self.log_info("Planning scene with workspace boundaries has been set up.")
@@ -353,24 +366,6 @@ class ME314_XArm_Queue_Commander(Node):
             self.log_error(f"Error applying planning scene: {e}")
 
     ####################################################################
-    # LOGGING METHODS
-    ####################################################################
-    def log_info(self, message):
-        """Log information with green color"""
-        colored_message = f"{self.GREEN}[XArm] {message}{self.RESET}"
-        self.get_logger().info(colored_message)
-    
-    def log_warn(self, message):
-        """Log warnings with red color"""
-        colored_message = f"{self.RED}{self.BOLD}[XArm] WARNING: {message}{self.RESET}"
-        self.get_logger().warn(colored_message)
-    
-    def log_error(self, message):
-        """Log errors with red color and bold"""
-        colored_message = f"{self.RED}{self.BOLD}[XArm] ERROR: {message}{self.RESET}"
-        self.get_logger().error(colored_message)
-
-    ####################################################################
     # QUEUE METHODS
     ####################################################################
     def command_queue_callback(self, msg: CommandQueue):
@@ -407,8 +402,6 @@ class ME314_XArm_Queue_Commander(Node):
                     self.log_info("Queued home command")
                 else:
                     self.log_warn(f"Unknown command type: {command.command_type}")
-
-            self.execution_condition.notify()
 
         self.log_info(f"Added {len(msg.commands)} commands. Current queue size: {len(self.command_queue)}")
 
@@ -450,6 +443,7 @@ class ME314_XArm_Queue_Commander(Node):
             else:
                 self.log_warn("Command execution failed")
                 self.command_failed = True
+
             self.is_executing = False
 
     def publish_queue_status(self):
@@ -507,6 +501,50 @@ class ME314_XArm_Queue_Commander(Node):
             self.planning_scene.is_diff = True
             self.apply_planning_scene(self.planning_scene)
 
+    def ft_sensor_callback(self, msg: WrenchStamped):
+        """
+        Callback for processing force/torque sensor data.
+        Updates the last external force magnitude and checks against the threshold.
+        """
+        fx = msg.wrench.force.x
+        fy = msg.wrench.force.y
+        fz = msg.wrench.force.z
+        self.last_ext_force_mag = math.sqrt(fx**2 + fy**2 + fz**2)
+
+    def check_ft_threshold(self):
+        """
+        Called at high rate. If a trajectory is running and the net force exceeds
+        the threshold, cancel the action immediately.
+        """
+        if not self.is_executing or self.controller_goal_handle is None:
+            return
+
+        if self.last_ext_force_mag > self.ft_threshold:
+            self.log_warn(f"FT threshold exceeded: {self.last_ext_force_mag:.2f} N > {self.ft_threshold:.2f} N")
+            self.publish_collision_status(True)
+            
+            # Cancel the low-level controller goal
+            cancel_fut = self.controller_goal_handle.cancel_goal_async()
+            spin_until_future_complete(self, cancel_fut, timeout_sec=1.0)
+            self.log_info("Controller trajectory canceled")
+            
+            # Mark as not executing so new commands can be processed
+            with self.queue_lock:
+                self.is_executing = False
+                if self.command_queue:
+                    self.command_queue.popleft()  # Remove the command that caused collision
+                    self.log_info("Command removed from queue due to collision")
+
+    def publish_collision_status(self, is_collision):
+        """
+        Publish the collision status to notify other nodes.
+        """
+        msg = Bool()
+        msg.data = is_collision
+        self.collision_pub.publish(msg)
+        if is_collision:
+            self.log_warn("Collision detected!")
+
     def publish_current_joint_positions(self):
         """
         Publish the current joint positions (converted to degrees) to the relevant topic.
@@ -524,9 +562,8 @@ class ME314_XArm_Queue_Commander(Node):
         """
         if None in self.curr_joint_positions:
             return
-        robot_state = RobotState()
-        robot_state.joint_state.name = self.joint_names
-        robot_state.joint_state.position = self.curr_joint_positions
+        
+        robot_state = RobotState(joint_state=JointState(name=self.joint_names, position=self.curr_joint_positions))
 
         req = GetPositionFK.Request()
         req.header.frame_id = "link_base"
@@ -659,46 +696,134 @@ class ME314_XArm_Queue_Commander(Node):
             if callback:
                 callback(False)
             return
+        
+        # Check for collision-related planning errors
+        if result.motion_plan_response.error_code.val == -31: # PLANNING_FAILED due to collision
+            self.log_error("Planning failed due to collision!")
+            self.publish_collision_status(True)
+            if callback:
+                callback(False)
+            return
+        elif result.motion_plan_response.error_code.val != 1:
+            self.log_error(f"Planning failed, error code = {result.motion_plan_response.error_code.val}")
+            if callback:
+                callback(False)
+            return
+        else:
+            # Clear any previous collision status
+            self.publish_collision_status(False)
 
         self.log_info("Joint motion plan succeeded, executing trajectory...")
         self.execute_trajectory_async(result.motion_plan_response.trajectory, callback)
 
     def execute_trajectory_async(self, trajectory: RobotTrajectory, callback=None):
         """
-        Execute a planned trajectory asynchronously using the ExecuteTrajectory action server.
+        Execute a planned trajectory asynchronously.
+        Uses low-level controller for arm, MoveIt for gripper.
         """
-        goal_msg = ExecuteTrajectory.Goal()
-        goal_msg.trajectory = trajectory
+        # Determine if this is a gripper trajectory by checking the joint names
+        is_gripper_trajectory = False
+        if trajectory.joint_trajectory.joint_names:
+            for joint_name in trajectory.joint_trajectory.joint_names:
+                if joint_name in self.gripper_joint_names or "gripper" in joint_name:
+                    is_gripper_trajectory = True
+                    break
+        
+        # If it's a gripper trajectory, use the original MoveIt execution approach
+        if is_gripper_trajectory:
+            self.log_info("Sending gripper trajectory via MoveIt...")
+            goal_msg = ExecuteTrajectory.Goal()
+            goal_msg.trajectory = trajectory
+            send_goal_future = self.execute_client.send_goal_async(goal_msg)
+            send_goal_future.add_done_callback(lambda f: self.gripper_action_send_callback(f, callback))
+        else:
+            # For arm trajectories, use the direct low-level controller
+            jt = trajectory.joint_trajectory
+            goal_msg = FollowJointTrajectory.Goal()
+            goal_msg.trajectory = jt
+            self.log_info("Sending arm trajectory to low-level controller...")
+            send_goal_future = self.arm_ctrl_client.send_goal_async(goal_msg)
+            send_goal_future.add_done_callback(lambda f: self.low_level_controller_send_callback(f, callback))
 
-        self.log_info("Sending trajectory for execution...")
-        send_goal_future = self.execute_client.send_goal_async(goal_msg)
-        send_goal_future.add_done_callback(lambda f: self.action_server_send_callback(f, callback))
-
-    def action_server_send_callback(self, future, callback):
+    def low_level_controller_send_callback(self, future, callback):
         """
-        Callback for handling the response after sending a trajectory goal to the action server.
+        Callback for handling the response after sending a trajectory goal to the low-level controller.
         """
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.log_error("ExecuteTrajectory goal was rejected by server.")
+            self.log_error("FollowJointTrajectory goal was rejected by controller server.")
+            if callback:
+                callback(False)
+            return
+        
+        # Store the goal handle as a class member - this is the ACTUAL controller handle
+        self.controller_goal_handle = goal_handle
+        
+        self.log_info("Goal accepted by controller, waiting for result...")
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(lambda f: self.low_level_controller_execute_callback(f, callback))
+
+    def low_level_controller_execute_callback(self, future, callback):
+        """
+        Callback function for processing the trajectory execution result from the low-level controller.
+        """
+        try:
+            result = future.result().result
+            
+            # Check the error code
+            if result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
+                self.log_error(f"Trajectory execution failed with error code: {result.error_code}")
+                if callback:
+                    callback(False)
+                return
+                
+            # Clear any previous collision status
+            self.publish_collision_status(False)
+            
+            self.log_info("Trajectory execution succeeded.")
+            if callback:
+                callback(True)
+        except Exception as e:
+            self.log_error(f"Error in trajectory execution: {e}")
+            if callback:
+                callback(False)
+
+    def gripper_action_send_callback(self, future, callback):
+        """
+        Callback for handling the response after sending a gripper trajectory goal to MoveIt.
+        """
+        goal_handle = future.result()
+        self.controller_goal_handle = goal_handle
+        if not goal_handle.accepted:
+            self.log_error("Gripper ExecuteTrajectory goal was rejected by server.")
             if callback:
                 callback(False)
             return
 
-        self.log_info("Goal accepted by server, waiting for result...")
+        self.log_info("Gripper goal accepted by MoveIt, waiting for result...")
         result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(lambda f: self.action_server_execute_callback(f, callback))
+        result_future.add_done_callback(lambda f: self.gripper_action_execute_callback(f, callback))
 
-    def action_server_execute_callback(self, future, callback):
+    def gripper_action_execute_callback(self, future, callback):
         """
-        Callback function for processing the trajectory execution result from the action server.
+        Callback function for processing the gripper trajectory execution result from MoveIt.
         """
         result = future.result().result
-        if result.error_code.val != 1:
+        # Check for collision-related execution errors
+        if result.error_code.val in [-10, -11, -12]:  # Path or goal collision errors
+            self.log_error(f"Trajectory execution failed due to collision, error code: {result.error_code.val}")
+            self.publish_collision_status(True)
+            if callback:
+                callback(False)
+            return
+        elif result.error_code.val != 1:
             self.log_error(f"Trajectory execution failed with error code: {result.error_code.val}")
             if callback:
                 callback(False)
             return
+        else:
+            # Clear any previous collision status
+            self.publish_collision_status(False)
 
         self.log_info("Trajectory execution succeeded.")
         if callback:
@@ -718,15 +843,17 @@ class ME314_XArm_Queue_Commander(Node):
         c = Constraints()
         motion_req.goal_constraints.append(c)
         
-        # Add constraints with explicit attributes
-        for jn in self.gripper_joint_names:
-            constraint = JointConstraint()
-            constraint.joint_name = jn
-            constraint.position = position
-            constraint.tolerance_above = 0.01
-            constraint.tolerance_below = 0.01
-            constraint.weight = 1.0
-            c.joint_constraints.append(constraint)
+        # Add joint constraints for the gripper
+        c.joint_constraints = [
+            JointConstraint(
+                joint_name=jn,
+                position=position,
+                tolerance_above=0.01,
+                tolerance_below=0.01,
+                weight=1.0
+            )
+            for jn in self.gripper_joint_names
+        ]
         
         motion_req.group_name = self.gripper_group_name
         motion_req.num_planning_attempts = 10
@@ -734,11 +861,32 @@ class ME314_XArm_Queue_Commander(Node):
         motion_req.max_velocity_scaling_factor = 0.1
         motion_req.max_acceleration_scaling_factor = 0.1
 
+        # Set request and call service
         req.motion_plan_request = motion_req
-
         self.log_info(f"Planning gripper motion to {math.degrees(position):.2f}")
+
+        # Call service and add callback
         future = self.plan_path_client.call_async(req)
         future.add_done_callback(lambda f: self.plan_path_done_cb(f, callback))
+
+    ####################################################################
+    # LOGGING METHODS
+    ####################################################################
+    def log_info(self, message):
+        """Log information with green color"""
+        colored_message = f"{self.GREEN}[XArm] {message}{self.RESET}"
+        self.get_logger().info(colored_message)
+    
+    def log_warn(self, message):
+        """Log warnings with red color"""
+        colored_message = f"{self.RED}{self.BOLD}[XArm] WARNING: {message}{self.RESET}"
+        self.get_logger().warn(colored_message)
+    
+    def log_error(self, message):
+        """Log errors with red color and bold"""
+        colored_message = f"{self.RED}{self.BOLD}[XArm] ERROR: {message}{self.RESET}"
+        self.get_logger().error(colored_message)
+
 
 
 def main(args=None):
