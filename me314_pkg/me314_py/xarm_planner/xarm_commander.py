@@ -16,7 +16,7 @@ from rclpy.action import ActionClient
 from geometry_msgs.msg import Pose, PoseStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String, Bool
-from xarm_msgs.srv import SetInt16, Call
+from xarm_msgs.srv import SetInt16, SetFloat32List, Call
 
 # Custom message type for command queue (which contains an array of CommandWrapper messages)
 from me314_msgs.msg import CommandQueue
@@ -148,13 +148,16 @@ class ME314_XArm_Queue_Commander(Node):
         # Store collision objects here so we can reapply them in each planning scene update
         self.boundary_collision_objects = []
 
+    ####################################################################
+    # INITIALIZATION METHODS
+    ####################################################################
     def init_ft_sensor(self):
         """
         Initialize the force/torque sensor by enabling it, zeroing it, and clearing any errors.
         """
         self.call_service(self.enable_FT_client, SetInt16.Request(data=1), "FT sensor enabled successfully!", "FT enable")
         self.call_service(self.zero_FT_client, Call.Request(), "FT sensor zeroed successfully!", "FT zero")
-        self.call_service(self.set_arm_state_client, SetInt16.Request(data=0), "Robot state set to READY successfully 🎉", "Set state")
+        self.call_service(self.set_arm_state_client, SetInt16.Request(data=0), "Robot state set to READY successfully 🎉", "Set state")   
 
     def call_service(self, client, request, success_msg, name, pre_delay=0):
         """
@@ -177,6 +180,66 @@ class ME314_XArm_Queue_Commander(Node):
         else:
             self.log_info(success_msg)
 
+    def gripper_init_callback(self, success: Bool):
+        """
+        Callback invoked after the gripper initialization command is completed.
+        """
+        if success:
+            self.log_info("Initialization complete. Ready to process commands.")
+            self.initialization_complete = True
+        else:
+            self.log_warn("Initialization failed. Gripper open command failed.")
+            self.initialization_complete = True
+
+    def wait_for_all_services_and_action(self):
+        """Wait for all services and action servers to become available."""
+        services = [
+            (self.cartesian_path_client, 'compute_cartesian_path'),
+            (self.compute_ik_client, 'compute_ik'),
+            (self.plan_path_client, 'plan_kinematic_path'),
+            (self.fk_client, 'compute_fk'),
+            (self.get_plan_scene_client, 'get_planning_scene'),
+            (self.apply_plan_scene_client, 'apply_planning_scene'),
+        ]
+        
+        if not self.use_sim:
+            services.extend([
+                (self.enable_FT_client, 'xarm/ft_sensor_enable'),
+                (self.zero_FT_client, 'xarm/ft_sensor_set_zero'),
+                (self.set_arm_state_client, 'xarm/set_state')
+            ])
+        
+        for client, name in services:
+            while not client.wait_for_service(timeout_sec=1.0):
+                self.log_info(f'Waiting for {name} service...')
+                
+        while not self.execute_client.wait_for_server(timeout_sec=1.0):
+            self.log_info('Waiting for execute_trajectory action server...')
+            
+        self.log_info('All services and action servers are available!')
+
+    def home_move_done_callback(self, success: bool):
+        """
+        Callback for when the home position move is completed.
+        Sets up the planning scene if the move succeeded.
+        """
+        if not success:
+            self.log_warn("Failed to move to home position (joint-based).")
+        else:
+            self.log_info("Home position move completed successfully (joint-based).")
+
+            # Open the gripper fully after home position is reached
+            self.log_info("Opening gripper fully.")
+            self.plan_execute_gripper_async(0.0, callback=self.gripper_init_callback)
+
+            # Setup planning scene with workspace bounds now that the robot is at home
+            self.setup_planning_scene()
+
+            # Initialize the force/torque sensor
+            if not self.use_sim:
+                self.log_info("Initializing FT sensor.")
+                self.init_ft_sensor()
+
     ####################################################################
     # PLANNING SCENE METHODS
     ####################################################################
@@ -188,11 +251,11 @@ class ME314_XArm_Queue_Commander(Node):
         self.log_info("Setting up planning scene with workspace boundaries...")
         
         # Convert mm bounds to meters for planning scene
-        x_l, x_u = self.x_bounds[0] / 1000.0, self.x_bounds[1] / 1000.0
-        y_l, y_u = self.y_bounds[0] / 1000.0, self.y_bounds[1] / 1000.0
-        z_l = self.z_bounds[0] / 1000.0
+        x_l, x_u = self.x_bounds[0] / 1000, self.x_bounds[1] / 1000
+        y_l, y_u = self.y_bounds[0] / 1000, self.y_bounds[1] / 1000
+        z_l = self.z_bounds[0] / 1000
 
-        x_c, y_c = (x_l + x_u) / 2.0, (y_l + y_u) / 2.0
+        x_c, y_c = (x_l + x_u) / 2, (y_l + y_u) / 2
         x_w, y_w = (x_u - x_l) + 0.1, (y_u - y_l) + 0.1 
         
         # Create collision objects for the 5 planes of the box (open top)
@@ -213,7 +276,7 @@ class ME314_XArm_Queue_Commander(Node):
         
         # Relevant robot links to add padding for self-collision
         acm_links = ["link_tcp", "link_eef", "link_base", "left_inner_knuckle", "left_outer_knuckle",
-            "right_inner_knuckle", "right_outer_knuckle", "right_finger", "left_finger", "xarm_gripper_base_link"]
+            "right_inner_knuckle", "right_outer_knuckle", "right_finger", "left_finger", "xarm_gripper_base_link", "ft_sensor_link", "link7"]
         
         # Add padding to all robot links
         self.planning_scene.link_padding = []
@@ -310,17 +373,6 @@ class ME314_XArm_Queue_Commander(Node):
     ####################################################################
     # QUEUE METHODS
     ####################################################################
-    def gripper_init_callback(self, success: Bool):
-        """
-        Callback invoked after the gripper initialization command is completed.
-        """
-        if success:
-            self.log_info("Initialization complete. Ready to process commands.")
-            self.initialization_complete = True
-        else:
-            self.log_warn("Initialization failed. Gripper open command failed.")
-            self.initialization_complete = True
-
     def command_queue_callback(self, msg: CommandQueue):
         """
         Process the incoming CommandQueue message and add each command to the internal queue.
@@ -430,56 +482,8 @@ class ME314_XArm_Queue_Commander(Node):
         self.current_command_pub.publish(current_command_msg)
 
     ####################################################################
-    # CORE METHODS
+    # CORE MOVEMENT METHODS
     ####################################################################
-    def wait_for_all_services_and_action(self):
-        """Wait for all services and action servers to become available."""
-        services = [
-            (self.cartesian_path_client, 'compute_cartesian_path'),
-            (self.compute_ik_client, 'compute_ik'),
-            (self.plan_path_client, 'plan_kinematic_path'),
-            (self.fk_client, 'compute_fk'),
-            (self.get_plan_scene_client, 'get_planning_scene'),
-            (self.apply_plan_scene_client, 'apply_planning_scene'),
-        ]
-        
-        if not self.use_sim:
-            services.extend([
-                (self.enable_FT_client, 'xarm/ft_sensor_enable'),
-                (self.zero_FT_client, 'xarm/ft_sensor_set_zero'),
-                (self.set_arm_state_client, 'xarm/set_state')
-            ])
-        
-        for client, name in services:
-            while not client.wait_for_service(timeout_sec=1.0):
-                self.log_info(f'Waiting for {name} service...')
-                
-        while not self.execute_client.wait_for_server(timeout_sec=1.0):
-            self.log_info('Waiting for execute_trajectory action server...')
-            
-        self.log_info('All services and action servers are available!')
-
-    def home_move_done_callback(self, success: bool):
-        """
-        Callback for when the home position move is completed.
-        Sets up the planning scene if the move succeeded.
-        """
-        if not success:
-            self.log_warn("Failed to move to home position (joint-based).")
-        else:
-            self.log_info("Home position move completed successfully (joint-based).")
-
-            # Open the gripper fully after home position is reached
-            self.log_info("Opening gripper fully.")
-            self.plan_execute_gripper_async(0.0, callback=self.gripper_init_callback)
-            if not self.use_sim:
-                # Initialize the force/torque sensor
-                self.log_info("Initializing force/torque sensor.")
-                self.init_ft_sensor()
-
-            # Setup planning scene with workspace bounds now that the robot is at home
-            self.setup_planning_scene()
-
     def joint_state_callback(self, msg: JointState):
         """
         Callback for processing new joint state messages.
@@ -558,11 +562,6 @@ class ME314_XArm_Queue_Commander(Node):
         """
         Compute inverse kinematics for the given target pose and execute the resulting joint trajectory asynchronously.
         """
-        # For real hardware, apply an additional +0.058m offset to Z
-        if not self.use_sim:
-            self.log_info("Applying +0.058 m offset in Z because use_sim=False")
-            target_pose.position.z += 0.058
-
         ik_req = GetPositionIK.Request()
         ik_req.ik_request.group_name = "xarm7"
         ik_req.ik_request.robot_state.is_diff = True
@@ -621,8 +620,8 @@ class ME314_XArm_Queue_Commander(Node):
             constraint = JointConstraint()
             constraint.joint_name = joint_name
             constraint.position = j_pos[i]
-            constraint.tolerance_above = 0.01
-            constraint.tolerance_below = 0.01
+            constraint.tolerance_above = 0.001
+            constraint.tolerance_below = 0.001
             constraint.weight = 1.0
             c.joint_constraints.append(constraint)
             

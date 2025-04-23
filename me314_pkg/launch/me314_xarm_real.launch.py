@@ -34,7 +34,8 @@ def generate_launch_description():
             'add_realsense_d435i': 'true',
             'hw_ns': 'xarm',
             'no_gui_ctrl': 'false',
-            'report_type': 'rich'
+            'report_type': 'rich',
+            'add_ft_sensor': 'true',
         }.items()
     )
     
