@@ -1,4 +1,0 @@
-string command_type
-PoseCommand pose_command
-GripperCommand gripper_command
-JointCommand joint_command
