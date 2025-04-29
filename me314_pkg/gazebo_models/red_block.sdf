@@ -1,0 +1,53 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="block">
+    <static>false</static>
+    <link name="link">
+      <visual name="visual">
+        <geometry>
+          <box>
+            <size>0.0254 0.0254 0.0254</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 0 0 1</ambient>
+          <diffuse>1 0 0 1</diffuse>
+        </material>
+      </visual>
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>0.0254 0.0254 0.0254</size>
+          </box>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>50.0</mu>
+              <mu2>50.0</mu2>
+              <slip1>0.01</slip1>
+              <slip2>0.01</slip2>
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <kp>1e9</kp>
+              <kd>10</kd>
+            </ode>
+          </contact>
+        </surface>
+      </collision>
+      <inertial>
+        <mass>0.001</mass>
+        <inertia>
+          <ixx>2.15e-05</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>2.15e-05</iyy>
+          <iyz>0</iyz>
+          <izz>2.15e-05</izz>
+        </inertia>
+      </inertial>
+    </link>
+  </model>
+</sdf>
