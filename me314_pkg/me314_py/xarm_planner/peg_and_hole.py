@@ -35,12 +35,14 @@ class PickAndPlace(Node):
         self.gripper_status_sub = self.create_subscription(Float64, '/me314_xarm_gripper_position', self.gripper_position_callback, 10)
 
         # Simulation Subscribers
-        self.realsense_sub = self.create_subscription(Image, '/color/image_raw', self.realsense_callback, 10)
-        self.depth_sub = self.create_subscription(Image, '/aligned_depth_to_color/image_raw', self.depth_callback, 10)
+        # self.realsense_sub = self.create_subscription(Image, '/color/image_raw', self.realsense_callback, 10)
+        # self.depth_sub = self.create_subscription(Image, '/aligned_depth_to_color/image_raw', self.depth_callback, 10)
 
         # Real Subscribers
-        # self.realsense_sub = self.create_subscription(Image, '/camera/realsense2_camera_node/color/image_raw', self.realsense_callback, 10)
-        # self.depth_sub = self.create_subscription(Image, '/camera/realsense2_camera_node/aligned_depth_to_color/image_raw', self.depth_callback, 10)
+        self.realsense_sub = self.create_subscription(Image, '/camera/realsense2_camera_node/color/image_raw', self.realsense_callback, 10)
+        self.depth_sub = self.create_subscription(Image, '/camera/realsense2_camera_node/aligned_depth_to_color/image_raw', self.depth_callback, 10)
+
+        self.ft_sensor_sub = self.create_subscription(Float64, '/xarm/uf_ftsensor_ext_states',self.ft_callback, 10)
 
         self.realsense_sub
         self.depth_sub
@@ -56,6 +58,11 @@ class PickAndPlace(Node):
 
         self.found = False
         self.gotDepth = False
+
+        self.force = None
+        self.force_x = 0
+        self.force_y = 0
+        self.force_z = 0
 
     def arm_pose_callback(self, msg: Pose):
         self.current_arm_pose = msg
@@ -181,6 +188,13 @@ class PickAndPlace(Node):
                     self.get_logger().info(f"Found blue object at: {blue_center}")
                     self.hole_center = blue_center
 
+    def ft_callback (self, msg: Float64):
+        if msg is None:
+            self.get_logger().error("Received an empty image message!")
+            return
+        else:
+            self.force = msg.data
+
     # Mask for red object
     # Returns the annotated image and the (x, y) center of the largest red contour
     def mask_red_object(self, image: np.ndarray):
@@ -207,7 +221,7 @@ class PickAndPlace(Node):
             largest = max(contours, key=cv2.contourArea)
             M = cv2.moments(largest)
             if M["m00"] == 0:
-                return frame, (None, None)
+                return image, (None, None)
 
             # Calculate center
             cx = int(M["m10"] / M["m00"])
@@ -302,10 +316,10 @@ class PickAndPlace(Node):
     # Coordinate transformation from image to camera in world frame
     def img_pixel_to_cam(self, pixel_coords, depth_m):
         # Simulation Intrinsics
-        rgb_K = (640.5098266601562, 640.5098266601562, 640.0, 360.0)
+        # rgb_K = (640.5098266601562, 640.5098266601562, 640.0, 360.0)
 
         # Real Intrinsics
-        # rgb_K = (605.763671875, 606.1971435546875, 324.188720703125, 248.70957946777344)
+        rgb_K = (605.763671875, 606.1971435546875, 324.188720703125, 248.70957946777344)
 
         fx, fy, cx, cy = rgb_K
         u, v = pixel_coords
@@ -381,7 +395,7 @@ def main(args=None):
     node.get_logger().info(f"Blue world coords: {world_coords_blue}")
 
     # Create pose for red cylinder
-    pose_above_red = [world_coords_red[0, 0], world_coords_red[1, 0], world_coords_red[2, 0] + 0.1,
+    pose_above_red = [world_coords_red[0, 0], world_coords_red[1, 0], world_coords_red[2, 0] + 0.3,
                 1.0, 0.0, 0.0, 0.0]  # Assuming no rotation needed
     pose_red = [world_coords_red[0, 0], world_coords_red[1, 0], world_coords_red[2, 0] + 0.05,
                 1.0, 0.0, 0.0, 0.0]  # Assuming no rotation needed
