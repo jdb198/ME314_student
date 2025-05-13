@@ -401,6 +401,36 @@ class PickAndPlace(Node):
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
             self.get_logger().error(f"Failed to convert camera->base transform: {str(e)}")
             return None
+        
+     # Transform a point from camera frame to world/base frame
+    def transform_camera_to_world(self, point_camera_frame):
+        """
+        Transforms a point from camera optical frame to world frame using tf
+        """
+        try:
+            # Create a PointStamped for the transformation
+            camera_point = PointStamped()
+            camera_point.header.frame_id = 'camera_color_optical_frame'
+            camera_point.header.stamp = self.get_clock().now().to_msg()
+            
+            if isinstance(point_camera_frame, tuple) or isinstance(point_camera_frame, list):
+                camera_point.point.x = float(point_camera_frame[0])
+                camera_point.point.y = float(point_camera_frame[1])
+                camera_point.point.z = float(point_camera_frame[2])
+            else:
+                camera_point.point.x = float(point_camera_frame[0])
+                camera_point.point.y = float(point_camera_frame[1])
+                camera_point.point.z = float(point_camera_frame[2])
+            
+            # Get the transform and apply it
+            transform = self.tf_buffer.lookup_transform('world', camera_point.header.frame_id, rclpy.time.Time())
+            world_point = tf2_geometry_msgs.do_transform_point(camera_point, transform)
+            
+            return world_point
+            
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().error(f"TF Error: {e}")
+            return None
 
     # Create a 4x4 transformation matrix from quaternion and translation
     def create_transformation_matrix(self, quaternion: np.ndarray, translation: np.ndarray) -> np.ndarray:
@@ -466,7 +496,7 @@ class PickAndPlace(Node):
             # Convert 2D+depth to 3D in camera frame
             hole_3d = self.img_pixel_to_cam(self.hole_center, self.hole_depth/1000.0)
             # Transform to world frame
-            world_hole = self.camera_to_base_tf(hole_3d, 'camera_color_optical_frame')
+            world_hole = self.transform_camera_to_world(hole_3d)
             return world_hole
             
         return None
@@ -507,10 +537,10 @@ def main(args=None):
     if world_coords_hole is None:
         # Fallback to basic method
         camera_coords_hole = node.img_pixel_to_cam(node.hole_center, node.hole_depth/1000.0)
-        world_coords_hole = node.camera_to_base_tf(camera_coords_hole, 'camera_color_optical_frame')
+        world_coords_hole = node.transform_camera_to_world(camera_coords_hole)
 
     # Transform camera coordinates to world coordinates
-    world_coords_red = node.camera_to_base_tf(camera_coords_red, 'camera_color_optical_frame')
+    world_coords_red = node.transform_camera_to_world(camera_coords_red,)
 
     node.get_logger().info(f"Cylinder world coordinates: {world_coords_red}")
     node.get_logger().info(f"Hole world coordinates: {world_coords_hole}")
@@ -527,7 +557,7 @@ def main(args=None):
     pose_above_red = [
         world_coords_red[0, 0], 
         world_coords_red[1, 0], 
-        world_coords_red[2, 0] + 0.1,  # 10cm above
+        world_coords_red[2, 0] + 0.30,  # 50cm above
         1.0, 0.0, 0.0, 0.0  # Downward orientation
     ]
 
@@ -535,7 +565,7 @@ def main(args=None):
     pose_red = [
         world_coords_red[0, 0], 
         world_coords_red[1, 0], 
-        world_coords_red[2, 0] + 0.005,  # Slightly above to avoid collision
+        world_coords_red[2, 0] + 0.10,  # Slightly above to avoid collision
         1.0, 0.0, 0.0, 0.0
     ]
 
@@ -543,7 +573,7 @@ def main(args=None):
     pose_above_hole = [
         world_coords_hole[0, 0], 
         world_coords_hole[1, 0], 
-        world_coords_hole[2, 0] + 0.1,  # 10cm above
+        world_coords_hole[2, 0] + 0.30,  # 20cm above
         1.0, 0.0, 0.0, 0.0
     ]
 
@@ -551,7 +581,7 @@ def main(args=None):
     pose_hole = [
         world_coords_hole[0, 0], 
         world_coords_hole[1, 0], 
-        world_coords_hole[2, 0] + 0.02,  # Position for placement, slightly above
+        world_coords_hole[2, 0] + 0.20,  # Position for placement, slightly above
         1.0, 0.0, 0.0, 0.0
     ]
     
@@ -576,7 +606,7 @@ def main(args=None):
     node.get_logger().info("Lifting cylinder...")
     node.publish_pose(pose_above_red)
     time.sleep(2)
-    
+
     # 5. Move above the hole
     node.get_logger().info("Moving above hole...")
     node.publish_pose(pose_above_hole)

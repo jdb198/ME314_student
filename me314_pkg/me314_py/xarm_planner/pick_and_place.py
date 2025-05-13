@@ -45,10 +45,10 @@ class PickAndPlace(Node):
         self.realsense_sub
         self.depth_sub
 
-        self.cyl_center = None
-        self.cyl_depth = None
-        self.hole_center = None
-        self.hole_depth = None
+        self.cube_center = None
+        self.cube_depth = None
+        self.target_center = None
+        self.target_depth = None
 
         self.buffer_length = Duration(seconds=5, nanoseconds=0)
         self.tf_buffer = tf2_ros.Buffer(cache_time=self.buffer_length)
@@ -121,17 +121,17 @@ class PickAndPlace(Node):
     # ---------------------------------------------------------------------
 
     def depth_callback(self, msg: Image):
-        if self.cyl_center is None or self.hole_center is None:
-            # Red cylinder and blue square not detected yet
+        if self.cube_center is None or self.target_center is None:
+            # Red box and green square not detected yet
             return
         else:
-            # Both red cylinder and blue square are detected
-            self.get_logger().info("Both red cylinder and blue square detected.")
+            # Both red box and green square detected
+            self.get_logger().info("Both red box and green square detected.")
             aligned_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            rx, ry = self.cyl_center
-            self.cyl_depth = aligned_depth[ry, rx]  # Get depth at red cylinder center
-            gx, gy = self.hole_center
-            self.hole_depth = aligned_depth[gy, gx]  # Get depth at blue square center
+            rx, ry = self.cube_center
+            self.cube_depth = aligned_depth[ry, rx]  # Get depth at red box center
+            gx, gy = self.target_center
+            self.target_depth = aligned_depth[gy, gx]  # Get depth at green square center
 
     def realsense_callback(self, msg: Image):
         if msg is None:
@@ -140,13 +140,13 @@ class PickAndPlace(Node):
         
         self.get_logger().info('Received an image')
 
-        # If there are no center coordinates for red OR blue:
+        # If there are no center coordinates for red OR green:
         # 1) raise camera
         # 2) look for objects
         # 3) if both are found, set their coordinates
         # 4) if both are not found, raise camera return empty
 
-        if self.cyl_center is None or self.hole_center is None:
+        if self.cube_center is None or self.target_center is None:
             if self.current_arm_pose is not None:
                 # Raise the camera
                 pose = self.current_arm_pose
@@ -169,20 +169,18 @@ class PickAndPlace(Node):
 
                 cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
 
-                # Mask for red and blue objects
+                # Mask for red and green objects
                 masked_image_red, red_center = self.mask_red_object(cv_image)
-                masked_image_blue, blue_center = self.mask_blue_object(cv_image)
+                masked_image_green, green_center = self.mask_green_object(cv_image)
                 
                 if red_center != (None, None):
                     self.get_logger().info(f"Found red object at: {red_center}")
-                    self.cyl_center = red_center
+                    self.cube_center = red_center
 
-                if blue_center != (None, None):
-                    self.get_logger().info(f"Found blue object at: {blue_center}")
-                    self.hole_center = blue_center
+                if green_center != (None, None):
+                    self.get_logger().info(f"Found green object at: {green_center}")
+                    self.target_center = green_center
 
-    # Mask for red object
-    # Returns the annotated image and the (x, y) center of the largest red contour
     def mask_red_object(self, image: np.ndarray):
 
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
@@ -217,9 +215,7 @@ class PickAndPlace(Node):
             result = image.copy()
             cv2.circle(result, (cx, cy), 5, (0, 255, 0), -1)
             return result, (cx, cy)
-        
-    # Mask for green object
-    # Returns the annotated image and the (x, y) center of the largest green contour
+
     def mask_green_object(self, image: np.ndarray):
         """
         Detect the green object in the frame using HSV masking.
@@ -255,49 +251,6 @@ class PickAndPlace(Node):
         # cv2.drawContours(result, [largest_contour], -1, (0, 255, 0), 2)  # Green contour
         cv2.circle(result, (cx, cy), 5, (0, 0, 255), -1)  # Green center dot
         return result, (cx, cy)
-    
-    # Mask for blue object
-    # Returns the annotated image and the (x, y) center of the largest blue contour
-    def mask_blue_object(self, image: np.ndarray):
-        """
-        Detects a blue object (peg or hole) in the frame using HSV color masking.
-        Returns the annotated image and the (x, y) center of the largest blue contour.
-        """
-        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-
-        # Define HSV range for blue
-        lower_blue = np.array([100, 100, 100])
-        upper_blue = np.array([130, 255, 255])
-
-        # Create mask
-        mask = cv2.inRange(hsv, lower_blue, upper_blue)
-
-        # Morphological operations to clean the mask
-        mask = cv2.erode(mask, None, iterations=2)
-        mask = cv2.dilate(mask, None, iterations=2)
-
-        # Find contours
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if not contours:
-            return image, (None, None)
-
-        # Get the largest contour
-        largest_contour = max(contours, key=cv2.contourArea)
-        M = cv2.moments(largest_contour)
-        if M["m00"] == 0:
-            return image, (None, None)
-
-        # Calculate center
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-
-        # Annotate image
-        result = image.copy()
-        cv2.circle(result, (cx, cy), 5, (255, 255, 255), -1)  # White dot for visibility
-
-        return result, (cx, cy)
-
 
     # Coordinate transformation from image to camera in world frame
     def img_pixel_to_cam(self, pixel_coords, depth_m):
@@ -362,9 +315,9 @@ def main(args=None):
 
     while not node.found or not node.gotDepth:
         rclpy.spin_once(node)
-        if node.cyl_center is not None and node.hole_center is not None:
+        if node.cube_center is not None and node.target_center is not None:
             node.found = True
-        if node.cyl_depth is not None and node.hole_depth is not None:
+        if node.cube_depth is not None and node.target_depth is not None:
             node.gotDepth = True
 
     node.get_logger().info("Opening gripper...")
@@ -372,41 +325,41 @@ def main(args=None):
 
     # Convert pixel coords + depth to camera coordinates
     # camera_coords = self.img_pixel_to_cam(self.center_coordinates, depth_at_center_m)
-    camera_coords_red = node.img_pixel_to_cam(node.cyl_center, node.cyl_depth/1000.0)
-    camera_coords_blue = node.img_pixel_to_cam(node.hole_center, node.hole_depth/1000.0)
+    camera_coords_red = node.img_pixel_to_cam(node.cube_center, node.cube_depth/1000.0)
+    camera_coords_green = node.img_pixel_to_cam(node.target_center, node.target_depth/1000.0)
     # Transform camera coords to the robot arm frame
     world_coords_red = node.camera_to_base_tf(camera_coords_red, 'camera_color_optical_frame')
-    world_coords_blue = node.camera_to_base_tf(camera_coords_blue, 'camera_color_optical_frame')
+    world_coords_green = node.camera_to_base_tf(camera_coords_green, 'camera_color_optical_frame')
     node.get_logger().info(f"Red world coords: {world_coords_red}")
-    node.get_logger().info(f"Blue world coords: {world_coords_blue}")
+    node.get_logger().info(f"Green world coords: {world_coords_green}")
 
-    # Create pose for red cylinder
-    pose_above_red = [world_coords_red[0, 0], world_coords_red[1, 0], world_coords_red[2, 0] + 0.3,
+    # Create pose for red box
+    pose_above_red = [world_coords_red[0, 0], world_coords_red[1, 0], world_coords_red[2, 0] + 0.1,
                 1.0, 0.0, 0.0, 0.0]  # Assuming no rotation needed
     pose_red = [world_coords_red[0, 0], world_coords_red[1, 0], world_coords_red[2, 0] + 0.05,
                 1.0, 0.0, 0.0, 0.0]  # Assuming no rotation needed
-    node.get_logger().info(f"Red cylinder pose: {pose_red}")
+    node.get_logger().info(f"Red box pose: {pose_red}")
 
-    node.get_logger().info(f"Going above cylinder...")
+    node.get_logger().info(f"Going above cube...")
     node.publish_pose(pose_above_red)
 
-    node.get_logger().info(f"Lowering to cylinder...")
+    node.get_logger().info(f"Lowering to cube...")
     node.publish_pose(pose_red)
 
     # Now close the gripper.
     node.get_logger().info("Closing gripper...")
     node.publish_gripper_position(1.0)
 
-    node.get_logger().info(f"Moving cylinder up...")
+    node.get_logger().info(f"Moving cube up...")
     node.publish_pose(pose_above_red)
 
-    # Move the arm to the blue square
-    pose_blue = [world_coords_blue[0, 0], world_coords_blue[1, 0], world_coords_blue[2, 0] + 0.1,
+    # Move the arm to the green square
+    pose_green = [world_coords_green[0, 0], world_coords_green[1, 0], world_coords_green[2, 0] + 0.1,
                   1.0, 0.0, 0.0, 0.0]  # Assuming no rotation needed
-    node.get_logger().info(f"Blue square pose: {pose_blue}")
+    node.get_logger().info(f"Green square pose: {pose_green}")
 
-    node.get_logger().info(f"Going to blue target...")
-    node.publish_pose(pose_blue)
+    node.get_logger().info(f"Going to green target...")
+    node.publish_pose(pose_green)
 
     node.get_logger().info("Opening gripper...")
     node.publish_gripper_position(0.0)
