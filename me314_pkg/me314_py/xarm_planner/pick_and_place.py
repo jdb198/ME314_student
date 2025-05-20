@@ -258,7 +258,9 @@ class PickAndPlace(Node):
         # rgb_K = (640.5098266601562, 640.5098266601562, 640.0, 360.0)
 
         # Real Intrinsics
-        rgb_K = (605.763671875, 606.1971435546875, 324.188720703125, 248.70957946777344)
+        # rgb_K = (605.763671875, 606.1971435546875, 324.188720703125, 248.70957946777344)
+        # rgb_K = (428.16888427734375, 426.84771728515625, 428.16888427734375, 232.67684936523438)
+        rgb_K = (908.6455078125, 909.2957153320312, 646.2830810546875, 373.0643615722656)
 
         fx, fy, cx, cy = rgb_K
         u, v = pixel_coords
@@ -348,7 +350,7 @@ def main(args=None):
 
     # Now close the gripper.
     node.get_logger().info("Closing gripper...")
-    node.publish_gripper_position(1.0)
+    node.publish_gripper_position(0.75)
 
     node.get_logger().info(f"Moving cube up...")
     node.publish_pose(pose_above_red)

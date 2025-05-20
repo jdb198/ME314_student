@@ -2,7 +2,7 @@
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose, PointStamped, WrenchStamped
+from geometry_msgs.msg import Pose, PointStamped
 from std_msgs.msg import Float64
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
@@ -14,17 +14,15 @@ import tf2_geometry_msgs
 from image_geometry import PinholeCameraModel
 from rclpy.duration import Duration
 import time
-import torch
-from segment_anything import sam_model_registry, SamPredictor
 
-# Import the command queue message types
+# Import the command queue message types from the reference code
 from me314_msgs.msg import CommandQueue, CommandWrapper
 
 CAMERA_OFFSET = 0.058
 
-class PegAndHole(Node):
+class PickAndPlace(Node):
     def __init__(self):
-        super().__init__('pegandhole_node')
+        super().__init__('pickandplace_node')
 
         self.bridge = CvBridge()
         self.cam_model = PinholeCameraModel()
@@ -38,7 +36,7 @@ class PegAndHole(Node):
         self.current_gripper_position = None
         self.gripper_status_sub = self.create_subscription(Float64, '/me314_xarm_gripper_position', self.gripper_position_callback, 10)
 
-        # Simulation Subscribers (uncomment as needed)
+        # Simulation Subscribers
         # self.realsense_sub = self.create_subscription(Image, '/color/image_raw', self.realsense_callback, 10)
         # self.depth_sub = self.create_subscription(Image, '/aligned_depth_to_color/image_raw', self.depth_callback, 10)
         # self.camera_info_sub = self.create_subscription(CameraInfo, '/aligned_depth_to_color/camera_info', self.camera_info_callback, 10)
@@ -48,16 +46,7 @@ class PegAndHole(Node):
         self.depth_sub = self.create_subscription(Image, '/camera/realsense2_camera_node/aligned_depth_to_color/image_raw', self.depth_callback, 10)
         self.camera_info_sub = self.create_subscription(CameraInfo, '/camera/realsense2_camera_node/aligned_depth_to_color/camera_info', self.camera_info_callback, 10)
 
-        # Initialize variables to store the latest force/torque data
-        self.FT_force_x = 0.0
-        self.FT_force_y = 0.0
-        self.FT_force_z = 0.0
-        self.FT_torque_x = 0.0
-        self.FT_torque_y = 0.0
-        self.FT_torque_z = 0.0
-        
-        # Create a subscription to the force/torque sensor topic
-        self.ft_ext_state_sub = self.create_subscription(WrenchStamped, '/xarm/uf_ftsensor_ext_states', self.ft_ext_state_cb, 10)
+        self.ft_sensor_sub = self.create_subscription(Float64, '/xarm/uf_ftsensor_ext_states', self.ft_callback, 10)
 
         self.cyl_center = None
         self.cyl_depth = None
@@ -79,10 +68,7 @@ class PegAndHole(Node):
         self.force_y = 0
         self.force_z = 0
 
-        # Initialize SAM2 model
-        self.initialize_sam2()
-
-        self.get_logger().info("Peg and Hole Node Initialized")
+        self.get_logger().info("Enhanced Pick and Place node initialized")
 
     def arm_pose_callback(self, msg: Pose):
         self.current_arm_pose = msg
@@ -110,13 +96,13 @@ class PegAndHole(Node):
         wrapper.command_type = "pose"
         
         # Populate the pose_command with the values from the pose_array
-        wrapper.pose_command.x = pose_array[0]
-        wrapper.pose_command.y = pose_array[1]
-        wrapper.pose_command.z = pose_array[2]
-        wrapper.pose_command.qx = pose_array[3]
-        wrapper.pose_command.qy = pose_array[4]
-        wrapper.pose_command.qz = pose_array[5]
-        wrapper.pose_command.qw = pose_array[6]
+        wrapper.pose_command.x = float(pose_array[0])
+        wrapper.pose_command.y = float(pose_array[1])
+        wrapper.pose_command.z = float(pose_array[2])
+        wrapper.pose_command.qx = float(pose_array[3])
+        wrapper.pose_command.qy = float(pose_array[4])
+        wrapper.pose_command.qz = float(pose_array[5])
+        wrapper.pose_command.qw = float(pose_array[6])
         
         # Add the command to the queue and publish
         queue_msg.commands.append(wrapper)
@@ -149,52 +135,9 @@ class PegAndHole(Node):
         
         self.get_logger().info(f"Published gripper command to queue: {gripper_pos:.2f}")
 
-    def ft_ext_state_cb(self, msg: WrenchStamped):
-        """
-        Callback function that runs whenever a new force/torque message is received.
-        
-        This function extracts the force and torque data from the message
-        and stores it for later use.
-        
-        Args:
-            msg (WrenchStamped): The force/torque sensor message
-        """
-        # Extract force components from the message
-        self.FT_force_x = msg.wrench.force.x
-        self.FT_force_y = msg.wrench.force.y
-        self.FT_force_z = msg.wrench.force.z
-        
-        # Extract torque components from the message
-        self.FT_torque_x = msg.wrench.torque.x
-        self.FT_torque_y = msg.wrench.torque.y
-        self.FT_torque_z = msg.wrench.torque.z
-
     # ---------------------------------------------------------------------
-    #  SENSING AND DETECTION
+    #  NEW CODE
     # ---------------------------------------------------------------------
-
-    def initialize_sam2(self):
-        """Initialize the SAM2 model"""
-        try:
-            # Specify the model type and checkpoint path
-            model_type = "vit_b"  # Use smaller model for faster inference
-            checkpoint = "sam2_b.pth"  # Adjust path to where you have the SAM2 weights
-            
-            # Check if CUDA is available and set device accordingly
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.get_logger().info(f"Using device: {self.device}")
-            
-            # Load the SAM2 model
-            self.sam = sam_model_registry[model_type](checkpoint=checkpoint)
-            self.sam.to(device=self.device)
-            
-            # Create a predictor
-            self.sam_predictor = SamPredictor(self.sam)
-            
-            self.get_logger().info("SAM2 model initialized successfully")
-        except Exception as e:
-            self.get_logger().error(f"Failed to initialize SAM2 model: {str(e)}")
-            self.sam_predictor = None
 
     def depth_callback(self, msg: Image):
         aligned_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
@@ -219,6 +162,7 @@ class PegAndHole(Node):
             return
         
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
+        self.current_RGB = cv_image
         
         # If there's no detection for the cylinder or hole yet
         if not self.found_cylinder or not self.found_hole:
@@ -252,15 +196,23 @@ class PegAndHole(Node):
                     self.found_cylinder = True
                     self.get_logger().info(f"Found red cylinder at: {red_center}")
             
-            # Look for the hole using SAM2
+            # Look for the hole using the enhanced hole detection
             if not self.found_hole:
-                hole_center = self.detect_hole_with_sam2(cv_image)
+                hole_center = self.detect_hole_in_blue_object(cv_image)
                 if hole_center != (None, None):
                     self.hole_center = hole_center
                     self.found_hole = True
-                    self.get_logger().info(f"Found hole center with SAM2 at: {hole_center}")
+                    self.get_logger().info(f"Found hole center at: {hole_center}")
 
-    # Mask for red object (cylinder)
+    def ft_callback (self, msg: Float64):
+        if msg is None:
+            self.get_logger().error("Received an empty image message!")
+            return
+        else:
+            self.force = msg.data
+
+    # Mask for red object
+    # Returns the annotated image and the (x, y) center of the largest red contour
     def mask_red_object(self, image: np.ndarray):
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
 
@@ -294,110 +246,6 @@ class PegAndHole(Node):
             result = image.copy()
             cv2.circle(result, (cx, cy), 5, (0, 255, 0), -1)
             return result, (cx, cy)
-
-    # Mask for blue object (hole)
-    def detect_hole_with_sam2(self, image: np.ndarray):
-        """
-        Use SAM2 to detect the hole in the blue block.
-        Returns the (x, y) center of the detected hole.
-        """
-        if self.sam_predictor is None:
-            self.get_logger().warn("SAM2 model not initialized. Falling back to color-based detection.")
-            return self.detect_hole_in_blue_object(image)
-            
-        try:
-            # First identify the blue block using color filtering
-            hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-            lower_blue = np.array([100, 100, 100])
-            upper_blue = np.array([130, 255, 255])
-            blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
-            
-            # Clean up the mask to get a solid blue region
-            kernel = np.ones((5, 5), np.uint8)
-            blue_mask_clean = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel)
-            blue_mask_clean = cv2.morphologyEx(blue_mask_clean, cv2.MORPH_CLOSE, kernel)
-            
-            # Find the blue object contour
-            contours, _ = cv2.findContours(blue_mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                self.get_logger().warn("No blue object detected.")
-                return (None, None)
-                
-            # Get the largest blue contour
-            largest_contour = max(contours, key=cv2.contourArea)
-            M = cv2.moments(largest_contour)
-            if M["m00"] > 0:
-                # Find center of blue object
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                
-                # Create a mask just for the blue object
-                blue_obj_mask = np.zeros_like(blue_mask_clean)
-                cv2.drawContours(blue_obj_mask, [largest_contour], 0, 255, -1)
-                
-                # Apply mask to original image
-                blue_region = cv2.bitwise_and(image, image, mask=blue_obj_mask)
-                
-                # Set the image in the SAM predictor
-                self.sam_predictor.set_image(image)
-                
-                # Use the center of the blue region as a point prompt
-                input_point = np.array([[cx, cy]])
-                input_label = np.array([1])  # 1 for foreground
-                
-                # Get segmentation mask from SAM
-                masks, scores, logits = self.sam_predictor.predict(
-                    point_coords=input_point,
-                    point_labels=input_label,
-                    multimask_output=True
-                )
-                
-                # Get the highest scoring mask
-                best_mask_idx = np.argmax(scores)
-                best_mask = masks[best_mask_idx]
-                
-                # Now look for a darker region (hole) within the blue object
-                blue_gray = cv2.cvtColor(blue_region, cv2.COLOR_RGB2GRAY)
-                
-                # Apply threshold to find darker areas
-                _, dark_mask = cv2.threshold(blue_gray, 100, 255, cv2.THRESH_BINARY_INV)
-                
-                # Combine SAM mask with dark threshold
-                combined_mask = cv2.bitwise_and(dark_mask, dark_mask, mask=best_mask.astype(np.uint8) * 255)
-                
-                # Find contours in the final mask
-                hole_contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                # Filter contours to find the most likely hole
-                hole_candidates = []
-                for contour in hole_contours:
-                    area = cv2.contourArea(contour)
-                    if 50 < area < 5000:
-                        perimeter = cv2.arcLength(contour, True)
-                        if perimeter > 0:
-                            circularity = 4 * np.pi * area / (perimeter * perimeter)
-                            if circularity > 0.6:
-                                M = cv2.moments(contour)
-                                if M["m00"] > 0:
-                                    hx = int(M["m10"] / M["m00"])
-                                    hy = int(M["m01"] / M["m00"])
-                                    hole_candidates.append((contour, circularity, (hx, hy)))
-                
-                if hole_candidates:
-                    # Sort by circularity (highest first)
-                    hole_candidates.sort(key=lambda x: x[1], reverse=True)
-                    best_hole = hole_candidates[0]
-                    return best_hole[2]  # Return the center coordinates
-                
-                # If no hole found, return center of blue object as fallback
-                return (cx, cy)
-                
-        except Exception as e:
-            self.get_logger().error(f"Error in SAM2 hole detection: {str(e)}")
-            # Fallback to traditional method
-            return self.detect_hole_in_blue_object(image)
-            
-        return (None, None)
 
     # Enhanced hole detection - combines color detection with contour analysis
     def detect_hole_in_blue_object(self, image: np.ndarray):
@@ -504,6 +352,24 @@ class PegAndHole(Node):
         Y = (v - cy) * depth_m / fy
         Z = depth_m + CAMERA_OFFSET
         return (X, Y, Z)
+    
+        # if self.gotInfo and self.cam_model is not None:
+        #         # Use the calibrated camera model for accurate projection
+        #         ray = self.cam_model.projectPixelTo3dRay(pixel_coords)
+        #         x = ray[0] * depth_m
+        #         y = ray[1] * depth_m
+        #         z = ray[2] * depth_m
+        #         return (x, y, z)
+        # else:
+        #     # Fallback to manual calculation using approximate intrinsics
+        #     # Real Intrinsics (fallback)
+        #     rgb_K = (605.763671875, 606.1971435546875, 324.188720703125, 248.70957946777344)
+        #     fx, fy, cx, cy = rgb_K
+        #     u, v = pixel_coords
+        #     x = (u - cx) * depth_m / fx
+        #     y = (v - cy) * depth_m / fy
+        #     z = depth_m
+        #     return (x, y, z)
 
     # Coordinate transform from camera frame to base frame
     def camera_to_base_tf(self, camera_coords, frame_name: str):
@@ -533,13 +399,11 @@ class PegAndHole(Node):
                                                      [1]])
                 base_coords = transform_mat @ camera_coords_homogenous
                 return base_coords
-        except (tf2_ros.LookupException,
-                tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException) as e:
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
             self.get_logger().error(f"Failed to convert camera->base transform: {str(e)}")
             return None
 
-    # Transform camera coordinates to world coordinates
+    # Create a 4x4 transformation matrix from quaternion and translation
     def create_transformation_matrix(self, quaternion: np.ndarray, translation: np.ndarray) -> np.ndarray:
         """ Create a 4x4 homogeneous transform from (x, y, z, w) quaternion and (tx, ty, tz). """
         rotation_matrix = R.from_quat(quaternion).as_matrix()
@@ -547,13 +411,73 @@ class PegAndHole(Node):
         matrix[:3, :3] = rotation_matrix
         matrix[:3, 3] = translation
         return matrix
+    
+    # Generate point cloud from depth image
+    def generate_pc(self, masked_depth):
+        if not self.gotInfo:
+            self.get_logger().error("No camera info available for point cloud generation")
+            return None
+            
+        out = np.zeros([np.sum(masked_depth > 1), 3])
+        
+        i = 0
+        for v in range(masked_depth.shape[0]):
+            for u in range(masked_depth.shape[1]):
+                depth = masked_depth[v, u] 
+
+                if depth > 0.001:
+                    depth = depth * 0.001  # Convert to meters
+                    ray = self.cam_model.projectPixelTo3dRay((u, v))
+                    x = ray[0] * depth
+                    y = ray[1] * depth
+                    z = ray[2] * depth
+                    out[i, 0] = x
+                    out[i, 1] = y
+                    out[i, 2] = z
+                    i += 1
+        return out
+    
+    # Advanced hole detection using point cloud
+    def detect_hole_center_3d(self):
+        """
+        Use point cloud analysis to find the center of the hole in 3D space.
+        Returns world coordinates of the hole center.
+        """
+        if self.current_depth is None or not self.found_hole:
+            self.get_logger().error("Cannot detect hole in 3D: missing depth or hole detection")
+            return None
+            
+        # Create a mask for the blue object
+        hsv = cv2.cvtColor(self.current_RGB, cv2.COLOR_RGB2HSV)
+        lower_blue = np.array([100, 100, 100])
+        upper_blue = np.array([130, 255, 255])
+        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        
+        # Apply the mask to the depth image
+        masked_depth = cv2.bitwise_and(self.current_depth, self.current_depth, mask=blue_mask)
+        
+        # Generate point cloud
+        pc = self.generate_pc(masked_depth)
+        if pc is None or len(pc) == 0:
+            self.get_logger().error("Failed to generate point cloud for hole detection")
+            return None
+            
+        # Use the already detected hole center as guidance
+        if self.hole_center is not None and self.hole_depth is not None:
+            # Convert 2D+depth to 3D in camera frame
+            hole_3d = self.img_pixel_to_cam(self.hole_center, self.hole_depth/1000.0)
+            # Transform to world frame
+            world_hole = self.camera_to_base_tf(hole_3d, 'camera_color_optical_frame')
+            return world_hole
+            
+        return None
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PegAndHole()
-    
+    node = PickAndPlace()
+
     # First, find the objects
-    node.get_logger().info("Searching for objects using SAM2 for hole detection...")
+    node.get_logger().info("Searching for objects...")
     
     # Wait until both objects are found and depth is available
     while not (node.found_cylinder and node.found_hole and node.gotDepth and node.gotInfo):
@@ -561,7 +485,7 @@ def main(args=None):
         if node.found_cylinder:
             node.get_logger().info("Cylinder found!")
         if node.found_hole:
-            node.get_logger().info("Hole found with SAM2!")
+            node.get_logger().info("Hole found!")
         if node.gotDepth:
             node.get_logger().info("Depth information available")
         if node.gotInfo:
@@ -578,12 +502,16 @@ def main(args=None):
     camera_coords_red = node.img_pixel_to_cam(node.cyl_center, node.cyl_depth/1000.0)
     node.get_logger().info(f"Cylinder in camera frame: {camera_coords_red}")
     
-    # Get 3D coordinates in camera frame for the hole detected by SAM2
-    camera_coords_hole = node.img_pixel_to_cam(node.hole_center, node.hole_depth/1000.0)
-    
+    # Get 3D coordinates of hole center using point cloud analysis (more accurate)
+    world_coords_hole = node.detect_hole_center_3d()
+
+    if world_coords_hole is None:
+        # Fallback to basic method
+        camera_coords_hole = node.img_pixel_to_cam(node.hole_center, node.hole_depth/1000.0)
+        world_coords_hole = node.camera_to_base_tf(camera_coords_hole, 'camera_color_optical_frame')
+
     # Transform camera coordinates to world coordinates
     world_coords_red = node.camera_to_base_tf(camera_coords_red, 'camera_color_optical_frame')
-    world_coords_hole = node.camera_to_base_tf(camera_coords_hole, 'camera_color_optical_frame')
 
     node.get_logger().info(f"Cylinder world coordinates: {world_coords_red}")
     node.get_logger().info(f"Hole world coordinates: {world_coords_hole}")
@@ -594,37 +522,37 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
         return
-    
-# Create poses for the motion sequence
+
+    # Create poses for the motion sequence
     # Position slightly above the cylinder
     pose_above_red = [
-        world_coords_red[0, 0], 
-        world_coords_red[1, 0], 
-        world_coords_red[2, 0] + 0.30,  # 50cm above
+        world_coords_red[0], 
+        world_coords_red[1], 
+        world_coords_red[2] + 0.15,  # 10cm above
         1.0, 0.0, 0.0, 0.0  # Downward orientation
     ]
-
+    
     # Position at the cylinder for grasping
     pose_red = [
-        world_coords_red[0, 0], 
-        world_coords_red[1, 0], 
-        world_coords_red[2, 0] + 0.10,  # Slightly above to avoid collision
+        world_coords_red[0], 
+        world_coords_red[1], 
+        world_coords_red[2] + 0.05,  # Slightly above to avoid collision
         1.0, 0.0, 0.0, 0.0
     ]
-
+    
     # Position above the hole
     pose_above_hole = [
-        world_coords_hole[0, 0], 
-        world_coords_hole[1, 0], 
-        world_coords_hole[2, 0] + 0.30,  # 20cm above
+        world_coords_hole[0], 
+        world_coords_hole[1], 
+        world_coords_hole[2] + 0.15,  # 10cm above
         1.0, 0.0, 0.0, 0.0
     ]
-
+    
     # Position at the hole for placement
     pose_hole = [
-        world_coords_hole[0, 0], 
-        world_coords_hole[1, 0], 
-        world_coords_hole[2, 0] + 0.20,  # Position for placement, slightly above
+        world_coords_hole[0], 
+        world_coords_hole[1], 
+        world_coords_hole[2] + 0.08,  # Position for placement, slightly above
         1.0, 0.0, 0.0, 0.0
     ]
     
@@ -682,6 +610,7 @@ def main(args=None):
             node.init_arm_pose.orientation.z,
             node.init_arm_pose.orientation.w
         ]
+        node.publish_gripper_position(0.0)  # Open gripper
         node.publish_pose(init_pose)
     
     node.get_logger().info("Pick and place operation completed successfully!")

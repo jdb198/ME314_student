@@ -37,6 +37,8 @@ install(PROGRAMS
   me314_py/xarm_planner/xarm_commander.py
   me314_py/xarm_planner/pick_and_place.py
   me314_py/xarm_planner/peg_and_hole.py
+  me314_py/xarm_planner/peg_and_hole_v2.py
+  me314_py/xarm_planner/peg_and_hole_v3.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
