@@ -4,7 +4,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Pose
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, Bool
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -14,7 +14,7 @@ import tf2_geometry_msgs
 from geometry_msgs.msg import PointStamped
 # Import the command queue message types from the reference code
 from me314_msgs.msg import CommandQueue, CommandWrapper
-
+import time
 
 class Example(Node):
     def __init__(self):
@@ -39,14 +39,23 @@ class Example(Node):
         self.current_info = None
         self.info_sub = self.create_subscription(CameraInfo, '/aligned_depth_to_color/camera_info', self.camera_info_callback, 10)
 
+        # Create the subscriber
+        self.arm_executing_sub = self.create_subscription(Bool, '/me314_xarm_is_executing', self.execution_state_callback, 10)
+
         self.bridge = CvBridge()
         self.cam_model = PinholeCameraModel()
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
+        self.arm_executing = True
+
     def arm_pose_callback(self, msg: Pose):
         self.current_arm_pose = msg
+    
+    def execution_state_callback(self, msg: Bool):
+        print(msg.data)
+        self.arm_executing = msg.data
 
     def realsense_color_callback(self, msg: Image):
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -117,95 +126,178 @@ class Example(Node):
 
     def generate_pc(self, masked_depth):
         self.cam_model.fromCameraInfo(self.current_info)
-        out = np.zeros([np.sum(masked_depth > 1), 3])
-        
+        out = []
         i = 0
         for v in range(masked_depth.shape[0]):
             for u in range(masked_depth.shape[1]):
                 depth = masked_depth[v, u] 
 
                 if depth > 0.001:
+
+                    if np.random.rand() < 0.97:
+                        continue
                     depth = depth * 0.001
                     x, y, z = self.cam_model.projectPixelTo3dRay((u, v))
                     x *= depth
                     y *= depth
                     z *= depth
-                    out[i, 0] = x
-                    out[i, 1] = y
-                    out[i, 2] = z
-                    i += 1
-                    #self.get_logger().info(f"3D point at ({u}, {v}): ({x:.3f}, {y:.3f}, {z:.3f})")
-        return out   
-    
-    def transform_camera_to_world(self, point_camera_frame):
-        # converts to a point stamped, which is some ros format.
-        if type(point_camera_frame) == np.ndarray:
-            camera_point_ros = PointStamped()
 
-            camera_point_ros.header.frame_id = 'camera_color_optical_frame'
-            camera_point_ros.point.x = float(point_camera_frame[0])
-            camera_point_ros.point.y = float(point_camera_frame[1])
-            camera_point_ros.point.z = float(point_camera_frame[2])
-        else:
-            camera_point_ros = point_camera_frame
+                    out.append([x, y, z])
+                    i += 1
+                    
+        print("pointcloud generated")
+        return np.array(out)   
+    
+    def transform_camera_to_world(self, point_camera_frame:np.ndarray, rclpy_time):
+        # converts to a point stamped, which is some ros format.
+         
         transform = self.tf_buffer.lookup_transform(
                 'world',
                 'camera_color_optical_frame',
-                rclpy.time.Time()
+                rclpy_time
             )
+        all_points = np.zeros(point_camera_frame.shape)
 
-        # transform the point
-        point_in_world = tf2_geometry_msgs.do_transform_point(camera_point_ros, transform)
-        if type(point_camera_frame) == np.ndarray:
-            return np.array([point_in_world.point.x, point_in_world.point.y, point_in_world.point.z])
-        return point_in_world
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = Example()
+        for i in range(point_camera_frame.shape[0]):
 
-    # Define poses using the array format [x, y, z, qx, qy, qz, qw]
-    p0 = [0.3, -0.15, 0.3029, 1.0, 0.0, 0.0, 0.0]
+            camera_point_ros = PointStamped()
 
-    poses = [p0]
+            camera_point_ros.header.frame_id = 'camera_color_optical_frame'
+            camera_point_ros.point.x = float(point_camera_frame[i, 0])
+            camera_point_ros.point.y = float(point_camera_frame[i, 1])
+            camera_point_ros.point.z = float(point_camera_frame[i, 2])
 
-    # Let's first open the gripper (0.0 to 1.0, where 0.0 is fully open and 1.0 is fully closed)
-    node.get_logger().info("Opening gripper...")
-    node.publish_gripper_position(0.0)
+            # transform the point
+            point_in_world = tf2_geometry_msgs.do_transform_point(camera_point_ros, transform)
+            all_points[i, 0] = point_in_world.point.x
+            all_points[i, 1] = point_in_world.point.y
+            all_points[i, 2] = point_in_world.point.z
 
-    # Move the arm to each pose
-    for i, pose in enumerate(poses):
-        node.get_logger().info(f"Publishing Pose {i+1}...")
-        node.publish_pose(pose)
+        print("transform done")
+        return all_points
 
+def get_object_points(node: Example, mask_bounds:list):
     # Now look for the cube
-    while node.current_RGB is None or node.current_depth is None or node.current_info is None:
+    while node.current_RGB is None or node.current_depth is None or node.current_info is None or not node.tf_buffer.can_transform("world", "camera_color_optical_frame", rclpy.time.Time()):
         rclpy.spin_once(node, timeout_sec=0.1)
+
+    rclpy_time = rclpy.time.Time()
 
     # get the current RGBD info
     rgb_image = node.current_RGB.copy()
     depth_image = node.current_depth.copy()
 
     # Create a color mask to filter for the cube
-    mask = cv2.inRange(rgb_image, (0, 0, 100), (10, 10, 255))
+    #mask = cv2.inRange(rgb_image, (0, 0, 100), (10, 10, 255))
+    mask = cv2.inRange(rgb_image, mask_bounds[0], mask_bounds[1])
 
+    if np.sum(mask) == 0:
+        return np.empty((1))
+    #cv2.imshow("mask", mask)
+    #cv2.waitKey(0)
     # apply this mask to the depth image
     masked_depth = cv2.bitwise_and(depth_image, depth_image, mask=mask)
 
     # then create a pointcloud from the isolated depth image of the cube
     pc = node.generate_pc(masked_depth)
 
-    # find the centroid of these points
-    centroid = np.mean(pc, axis=0)
-    print("centroid", centroid)
+    # transform to world space
+    world_points = node.transform_camera_to_world(pc, rclpy_time)
 
+    return world_points
 
-    while not node.tf_buffer.can_transform("world", "camera_color_optical_frame", rclpy.time.Time()):
-        rclpy.spin_once(node, timeout_sec=0.1)
-    world_centroid = node.transform_camera_to_world(centroid)
-    print("world space centroid", world_centroid)
-    block_pose = [world_centroid[0], world_centroid[1], world_centroid[2]-0.003, 1.0, 0.0, 0.0, 0.0]
+def main(args=None):
+    rclpy.init(args=args)
+    node = Example()
+
+    cube_mask_bounds = [(0, 0, 100), (10, 10, 255)]
+    goal_mask_bounds = [(0, 100, 0), (10, 255, 10)]
+
+    # Define poses using the array format [x, y, z, qx, qy, qz, qw]
     
+    search_positions = [[0.15, -0.15, 0.4, 1.0, 0.0, 0.0, 0.0],
+                        [0.25, -0.15, 0.4, 1.0, 0.0, 0.0, 0.0],
+                        [0.35, -0.15, 0.4, 1.0, 0.0, 0.0, 0.0],
+                        [0.15, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+                        [0.25, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+                        [0.35, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+                        [0.15, 0.15, 0.4, 1.0, 0.0, 0.0, 0.0],
+                        [0.25, 0.15, 0.4, 1.0, 0.0, 0.0, 0.0],
+                        [0.35, 0.15, 0.4, 1.0, 0.0, 0.0, 0.0]]
+    
+
+    # Let's first open the gripper (0.0 to 1.0, where 0.0 is fully open and 1.0 is fully closed)
+    node.get_logger().info("Opening gripper...")
+    node.publish_gripper_position(0.0)
+
+    # We want to map out the space, move through a pattern and collect locations of relevant objects
+    cube_pts = []
+    goal_pts = []
+    
+    for i in range(len(search_positions)):
+        
+        new_pose = search_positions[i]
+        print("moving to new_pose")
+        node.publish_pose(new_pose)
+
+        while node.arm_executing:
+            rclpy.spin_once(node)
+
+        print("waiting complete, taking snapshot.")
+        
+        # only add if centroid is visible
+        new_cube_pts = get_object_points(node, cube_mask_bounds)
+        if new_cube_pts.size > 1:
+            cube_pts.append(new_cube_pts)
+        else:
+            print("cube not seen")
+
+        new_goal_pts = get_object_points(node, goal_mask_bounds)
+        if new_goal_pts.size > 1:
+            goal_pts.append(new_goal_pts)
+        else:
+            print("goal not seen")
+
+
+    cube_pts = np.concatenate(cube_pts, axis=0)
+    goal_pts = np.concatenate(goal_pts, axis=0)
+    """
+    import matplotlib.pyplot as plt
+
+    plt.figure()
+    plt.hist(cube_pts[:, 0])
+    plt.title("cube x")
+    plt.figure()
+    plt.hist(cube_pts[:, 1])
+    plt.title("cube y")
+    plt.figure()
+    plt.hist(cube_pts[:, 2])
+    plt.title("cube z")
+
+    plt.figure()
+    plt.hist(goal_pts[:, 0])
+    plt.title("goal x")
+    plt.figure()
+    plt.hist(goal_pts[:, 1])
+    plt.title("goal y")
+    plt.figure()
+    plt.hist(goal_pts[:, 2])
+    plt.title("goal z")
+    plt.show(block=True)
+    """
+    print(cube_pts.shape)
+    print(goal_pts.shape)
+
+    cube_world_centroid = np.mean(cube_pts, 0)  
+    goal_world_centroid = np.mean(goal_pts, 0)    
+
+    print("cube world space centroid", cube_world_centroid)
+    print("goal world space centroid", goal_world_centroid)
+
+    block_pose = [cube_world_centroid[0], cube_world_centroid[1], cube_world_centroid[2]-0.025, 1.0, 0.0, 0.0, 0.0]
+    goal_pose = [goal_world_centroid[0], goal_world_centroid[1], goal_world_centroid[2]-0.01, 1.0, 0.0, 0.0, 0.0]
+
     node.get_logger().info(f"Publishing Pose Block...")
     node.publish_pose(block_pose)
 
@@ -213,6 +305,13 @@ def main(args=None):
     node.get_logger().info("Closing gripper...")
     node.publish_gripper_position(1.0)
 
+    # Now move to goal
+    node.publish_pose(goal_pose)
+
+    # Now open the gripper.
+    node.get_logger().info("Opening gripper...")
+    node.publish_gripper_position(0.0)
+    
     node.get_logger().info("All actions done. Shutting down.")
 
     node.destroy_node()

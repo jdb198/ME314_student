@@ -3,7 +3,7 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Pose, PointStamped, WrenchStamped
-from std_msgs.msg import Float64, Bool
+from std_msgs.msg import Float64
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 import cv2
@@ -41,7 +41,7 @@ class PegAndHole(Node):
         # self.realsense_sub = self.create_subscription(Image, '/color/image_raw', self.realsense_callback, 10)
         # self.depth_sub = self.create_subscription(Image, '/aligned_depth_to_color/image_raw', self.depth_callback, 10)
         # self.camera_info_sub = self.create_subscription(CameraInfo, '/aligned_depth_to_color/camera_info', self.camera_info_callback, 10)
- 
+
         # Real Subscribers
         self.realsense_sub = self.create_subscription(Image, '/camera/realsense2_camera_node/color/image_raw', self.realsense_callback, 10)
         self.depth_sub = self.create_subscription(Image, '/camera/realsense2_camera_node/aligned_depth_to_color/image_raw', self.depth_callback, 10)
@@ -82,10 +82,6 @@ class PegAndHole(Node):
         self.hole_force_threshold = 0.5
         self.surface_force_threshold = 1.0
 
-        # Create the subscriber
-        self.arm_executing_sub = self.create_subscription(Bool, '/me314_xarm_is_executing', self.execution_state_callback, 10)
-        self.arm_executing = True
-
         self.get_logger().info("Peg and Hole Node Initialized")
 
     def arm_pose_callback(self, msg: Pose):
@@ -93,10 +89,6 @@ class PegAndHole(Node):
 
     def gripper_position_callback(self, msg: Float64):
         self.current_gripper_position = msg.data
-
-    def execution_state_callback(self, msg: Bool):
-        print("arm ex?", msg.data)
-        self.arm_executing = msg.data
 
     def camera_info_callback(self, msg: CameraInfo):
         self.camera_info = msg
@@ -586,7 +578,6 @@ class PegAndHole(Node):
                                                      [1]])
                 base_coords = transform_mat @ camera_coords_homogenous
                 return base_coords
-            
         except (tf2_ros.LookupException,
                 tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as e:
@@ -601,169 +592,14 @@ class PegAndHole(Node):
         matrix[:3, :3] = rotation_matrix
         matrix[:3, 3] = translation
         return matrix
-    
-    def generate_pc(self, masked_depth):
-        self.cam_model.fromCameraInfo(self.camera_info)
-        out = []
-        i = 0
-        for v in range(masked_depth.shape[0]):
-            for u in range(masked_depth.shape[1]):
-                depth = masked_depth[v, u] 
-
-                if depth > 0.001:
-
-                    if np.random.rand() < 0.97:
-                        continue
-                    depth = depth * 0.001
-                    x, y, z = self.cam_model.projectPixelTo3dRay((u, v))
-                    x *= depth
-                    y *= depth
-                    z *= depth
-
-                    out.append([x, y, z])
-                    i += 1
-                    
-        print("pointcloud generated")
-        return np.array(out)   
-    
-    def transform_camera_to_world(self, point_camera_frame:np.ndarray, rclpy_time):
-        # converts to a point stamped, which is some ros format.
-         
-        transform = self.tf_buffer.lookup_transform(
-                'world',
-                'camera_color_optical_frame',
-                rclpy_time
-            )
-        all_points = np.zeros(point_camera_frame.shape)
-
-
-        for i in range(point_camera_frame.shape[0]):
-
-            camera_point_ros = PointStamped()
-
-            camera_point_ros.header.frame_id = 'camera_color_optical_frame'
-            camera_point_ros.point.x = float(point_camera_frame[i, 0])
-            camera_point_ros.point.y = float(point_camera_frame[i, 1])
-            camera_point_ros.point.z = float(point_camera_frame[i, 2])
-
-            # transform the point
-            point_in_world = tf2_geometry_msgs.do_transform_point(camera_point_ros, transform)
-            all_points[i, 0] = point_in_world.point.x
-            all_points[i, 1] = point_in_world.point.y
-            all_points[i, 2] = point_in_world.point.z
-
-        print("transform done")
-        return all_points
-    
-def get_object_points(node: PegAndHole, mask_bounds:list):
-    # Now look for the tube
-    while node.current_RGB is None or node.current_depth is None or node.camera_info is None or not node.tf_buffer.can_transform("world", "camera_color_optical_frame", rclpy.time.Time()):
-        rclpy.spin_once(node, timeout_sec=0.1)
-
-    rclpy_time = rclpy.time.Time()
-
-    # get the current RGBD info
-    rgb_image = node.current_RGB.copy()
-    depth_image = node.current_depth.copy()
-
-    # Create a color mask to filter for the tube
-    #mask = cv2.inRange(rgb_image, (0, 0, 100), (10, 10, 255))
-
-    hsv_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
-    mask = cv2.inRange(hsv_image, mask_bounds[0], mask_bounds[1])
-
-    if np.sum(mask) == 0:
-        return np.empty((1))
-    #cv2.imshow("mask", mask)
-    #cv2.waitKey(0)
-    # apply this mask to the depth image
-    # Convert to HSV for better color segmentation
-        
-    masked_depth = cv2.bitwise_and(depth_image, depth_image, mask=mask)
-
-    # then create a pointcloud from the isolated depth image of the tube
-    pc = node.generate_pc(masked_depth)
-
-    # transform to world space
-    world_points = node.transform_camera_to_world(pc, rclpy_time)
-
-    return world_points
 
 def main(args=None):
     rclpy.init(args=args)
     node = PegAndHole()
     
     # First, find the objects
-    node.get_logger().info("Searching for objects using masking...")
+    node.get_logger().info("Searching for objects using SAM2 for hole detection...")
     
-    tube_mask_bounds = [(160, 100, 100), (180, 255, 255)]
-    goal_mask_bounds = [(100, 100, 100), (130, 255, 255)]
-
-    # Define poses using the array format [x, y, z, qx, qy, qz, qw]
-    
-    search_positions = [[0.15, -0.15, 0.3, 1.0, 0.0, 0.0, 0.0],
-                        [0.25, -0.15, 0.3, 1.0, 0.0, 0.0, 0.0],
-                        [0.35, -0.15, 0.3, 1.0, 0.0, 0.0, 0.0],
-                        [0.15, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0],
-                        [0.25, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0],
-                        [0.35, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0],
-                        [0.15, 0.15, 0.3, 1.0, 0.0, 0.0, 0.0],
-                        [0.25, 0.15, 0.3, 1.0, 0.0, 0.0, 0.0],
-                        [0.35, 0.15, 0.3, 1.0, 0.0, 0.0, 0.0]]
-
-    # We want to map out the space, move through a pattern and collect locations of relevant objects
-    tube_pts = []
-    goal_pts = []
-    node.publish_pose([0.25, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0])
-    # Open gripper at start
-    node.get_logger().info("Opening gripper...")
-    node.publish_gripper_position(0.0)
-    time.sleep(1)  # Wait for gripper to open
-    mandatory_spinning_time = 5
-
-    for i in range(len(search_positions)):
-        loop_start = time.time()
-        while time.time() - loop_start < mandatory_spinning_time:
-            rclpy.spin_once(node)
-
-        new_pose = search_positions[i]
-        print("moving to new_pose")
-        node.publish_pose(new_pose)
-
-        while node.arm_executing:
-            rclpy.spin_once(node)
-
-        print("waiting complete, taking snapshot.")
-        
-        # only add if centroid is visible
-        new_tube_pts = get_object_points(node, tube_mask_bounds)
-        if new_tube_pts.size > 1:
-            tube_pts.append(new_tube_pts)
-        else:
-            print("tube not seen")
-
-        new_goal_pts = get_object_points(node, goal_mask_bounds)
-        if new_goal_pts.size > 1:
-            goal_pts.append(new_goal_pts)
-        else:
-            print("goal not seen")
-
-    tube_pts = np.concatenate(tube_pts, axis=0)
-    goal_pts = np.concatenate(goal_pts, axis=0)
-    print("tube pts shape", tube_pts.shape)
-    print("goal pts shape", goal_pts.shape)
-
-    tube_world_centroid = np.mean(tube_pts, 0)  
-    goal_world_centroid = np.mean(goal_pts, 0)    
-
-    print("cube world space centroid", tube_world_centroid)
-    print("goal world space centroid", goal_world_centroid)
-
-    world_coords_red = [tube_world_centroid[0], tube_world_centroid[1], tube_world_centroid[2]-0.025, 1.0, 0.0, 0.0, 0.0]
-    world_coords_hole = [goal_world_centroid[0], goal_world_centroid[1], goal_world_centroid[2]-0.01, 1.0, 0.0, 0.0, 0.0]
-
-
-    """
     # Wait until both objects are found and depth is available
     while not (node.found_cylinder and node.found_hole and node.gotDepth and node.gotInfo):
         rclpy.spin_once(node)
@@ -777,8 +613,12 @@ def main(args=None):
             node.get_logger().info("Camera calibration available")
     
     node.get_logger().info("Objects located successfully!")
-    """
-    """
+    
+    # Open gripper at start
+    node.get_logger().info("Opening gripper...")
+    node.publish_gripper_position(0.0)
+    time.sleep(1)  # Wait for gripper to open
+    
     # Get 3D coordinates in camera frame
     camera_coords_red = node.img_pixel_to_cam(node.cyl_center, node.cyl_depth/1000.0)
     node.get_logger().info(f"Cylinder in camera frame: {camera_coords_red}")
@@ -799,29 +639,29 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
         return
-    """
+    
     # Create poses for the motion sequence
     # Position slightly above the cylinder
     pose_above_red = [
-        world_coords_red[0], 
-        world_coords_red[1], 
-        world_coords_red[2] + 0.20,  # 20cm above
+        world_coords_red[0, 0], 
+        world_coords_red[1, 0], 
+        world_coords_red[2, 0] + 0.20,  # 20cm above
         1.0, 0.0, 0.0, 0.0  # Downward orientation
     ]
 
     # Position at the cylinder for grasping
     pose_red = [
-        world_coords_red[0], 
-        world_coords_red[1], 
-        world_coords_red[2] + 0.02,  # Slightly above to avoid collision
+        world_coords_red[0, 0], 
+        world_coords_red[1, 0], 
+        world_coords_red[2, 0] + 0.05,  # Slightly above to avoid collision
         1.0, 0.0, 0.0, 0.0
     ]
 
     # Position above the hole
     pose_above_hole = [
-        world_coords_hole[0], 
-        world_coords_hole[1], 
-        world_coords_hole[2] + 0.20,  # 20cm above
+        world_coords_hole[0, 0], 
+        world_coords_hole[1, 0], 
+        world_coords_hole[2, 0] + 0.20,  # 20cm above
         1.0, 0.0, 0.0, 0.0
     ]
     
@@ -857,15 +697,15 @@ def main(args=None):
     node.get_logger().info("FINDING BLOCK SURFACE HEIGHT USING FORCE FEEDBACK...")
     # Create a starting pose for height detection
     surface_detection_pose = [
-        world_coords_hole[0],
-        world_coords_hole[1],
-        world_coords_hole[2] + 0.15,  # Start 15cm above estimated position
+        world_coords_hole[0, 0],
+        world_coords_hole[1, 0],
+        world_coords_hole[2, 0] + 0.15,  # Start 15cm above estimated position
         1.0, 0.0, 0.0, 0.0
     ]
     
     surface_found, surface_z = node.find_contact_height(
         surface_detection_pose, 
-        world_coords_hole[2] + 0.15,  # Start height
+        world_coords_hole[2, 0] + 0.15,  # Start height
         step_size=0.005,  # 5mm steps
         max_steps=40
     )
@@ -897,8 +737,8 @@ def main(args=None):
     
     # Initial pose at center of hole location
     center_pose = [
-        world_coords_hole[0], 
-        world_coords_hole[1], 
+        world_coords_hole[0, 0], 
+        world_coords_hole[1, 0], 
         surface_z + 0.05,  # 5cm above surface for safety
         1.0, 0.0, 0.0, 0.0
     ]
