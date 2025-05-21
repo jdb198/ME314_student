@@ -661,7 +661,7 @@ def main(args=None):
     pose_above_hole = [
         world_coords_hole[0, 0], 
         world_coords_hole[1, 0], 
-        world_coords_hole[2, 0] + 0.30,  # 20cm above
+        world_coords_hole[2, 0] + 0.30,  # 30cm above
         1.0, 0.0, 0.0, 0.0
     ]
     
@@ -778,7 +778,7 @@ def main(args=None):
         ]
         node.publish_pose(init_pose)
     
-    # ADDED SUCCESS REPORTING BASED ON HOLE DETECTION
+    # Added logging for completion
     if hole_found:
         node.get_logger().info("PICK AND PLACE OPERATION COMPLETED SUCCESSFULLY! CYLINDER INSERTED INTO HOLE.")
     else:
