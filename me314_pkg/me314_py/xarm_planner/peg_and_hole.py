@@ -15,7 +15,6 @@ from image_geometry import PinholeCameraModel
 from rclpy.duration import Duration
 import time
 import torch
-from segment_anything import sam_model_registry, SamPredictor
 
 # Import the command queue message types
 from me314_msgs.msg import CommandQueue, CommandWrapper
@@ -79,8 +78,9 @@ class PegAndHole(Node):
         self.force_y = 0
         self.force_z = 0
 
-        # Initialize SAM2 model
-        self.initialize_sam2()
+        # Force thresholds for detecting contact with the surface and holes
+        self.hole_force_threshold = 0.5
+        self.surface_force_threshold = 1.0
 
         self.get_logger().info("Peg and Hole Node Initialized")
 
@@ -173,29 +173,6 @@ class PegAndHole(Node):
     #  SENSING AND DETECTION
     # ---------------------------------------------------------------------
 
-    def initialize_sam2(self):
-        """Initialize the SAM2 model"""
-        try:
-            # Specify the model type and checkpoint path
-            model_type = "vit_b"  # Use smaller model for faster inference
-            checkpoint = "sam2_b.pth"  # Adjust path to where you have the SAM2 weights
-            
-            # Check if CUDA is available and set device accordingly
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.get_logger().info(f"Using device: {self.device}")
-            
-            # Load the SAM2 model
-            self.sam = sam_model_registry[model_type](checkpoint=checkpoint)
-            self.sam.to(device=self.device)
-            
-            # Create a predictor
-            self.sam_predictor = SamPredictor(self.sam)
-            
-            self.get_logger().info("SAM2 model initialized successfully")
-        except Exception as e:
-            self.get_logger().error(f"Failed to initialize SAM2 model: {str(e)}")
-            self.sam_predictor = None
-
     def depth_callback(self, msg: Image):
         aligned_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
         self.current_depth = aligned_depth
@@ -219,6 +196,7 @@ class PegAndHole(Node):
             return
         
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
+        self.current_RGB = cv_image
         
         # If there's no detection for the cylinder or hole yet
         if not self.found_cylinder or not self.found_hole:
@@ -252,13 +230,13 @@ class PegAndHole(Node):
                     self.found_cylinder = True
                     self.get_logger().info(f"Found red cylinder at: {red_center}")
             
-            # Look for the hole using SAM2
+            # Look for the hole using the enhanced hole detection
             if not self.found_hole:
-                hole_center = self.detect_hole_with_sam2(cv_image)
+                hole_center = self.detect_hole_in_blue_object(cv_image)
                 if hole_center != (None, None):
                     self.hole_center = hole_center
                     self.found_hole = True
-                    self.get_logger().info(f"Found hole center with SAM2 at: {hole_center}")
+                    self.get_logger().info(f"Found hole center at: {hole_center}")
 
     # Mask for red object (cylinder)
     def mask_red_object(self, image: np.ndarray):
@@ -294,110 +272,6 @@ class PegAndHole(Node):
             result = image.copy()
             cv2.circle(result, (cx, cy), 5, (0, 255, 0), -1)
             return result, (cx, cy)
-
-    # Mask for blue object (hole)
-    def detect_hole_with_sam2(self, image: np.ndarray):
-        """
-        Use SAM2 to detect the hole in the blue block.
-        Returns the (x, y) center of the detected hole.
-        """
-        if self.sam_predictor is None:
-            self.get_logger().warn("SAM2 model not initialized. Falling back to color-based detection.")
-            return self.detect_hole_in_blue_object(image)
-            
-        try:
-            # First identify the blue block using color filtering
-            hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-            lower_blue = np.array([100, 100, 100])
-            upper_blue = np.array([130, 255, 255])
-            blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
-            
-            # Clean up the mask to get a solid blue region
-            kernel = np.ones((5, 5), np.uint8)
-            blue_mask_clean = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel)
-            blue_mask_clean = cv2.morphologyEx(blue_mask_clean, cv2.MORPH_CLOSE, kernel)
-            
-            # Find the blue object contour
-            contours, _ = cv2.findContours(blue_mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                self.get_logger().warn("No blue object detected.")
-                return (None, None)
-                
-            # Get the largest blue contour
-            largest_contour = max(contours, key=cv2.contourArea)
-            M = cv2.moments(largest_contour)
-            if M["m00"] > 0:
-                # Find center of blue object
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                
-                # Create a mask just for the blue object
-                blue_obj_mask = np.zeros_like(blue_mask_clean)
-                cv2.drawContours(blue_obj_mask, [largest_contour], 0, 255, -1)
-                
-                # Apply mask to original image
-                blue_region = cv2.bitwise_and(image, image, mask=blue_obj_mask)
-                
-                # Set the image in the SAM predictor
-                self.sam_predictor.set_image(image)
-                
-                # Use the center of the blue region as a point prompt
-                input_point = np.array([[cx, cy]])
-                input_label = np.array([1])  # 1 for foreground
-                
-                # Get segmentation mask from SAM
-                masks, scores, logits = self.sam_predictor.predict(
-                    point_coords=input_point,
-                    point_labels=input_label,
-                    multimask_output=True
-                )
-                
-                # Get the highest scoring mask
-                best_mask_idx = np.argmax(scores)
-                best_mask = masks[best_mask_idx]
-                
-                # Now look for a darker region (hole) within the blue object
-                blue_gray = cv2.cvtColor(blue_region, cv2.COLOR_RGB2GRAY)
-                
-                # Apply threshold to find darker areas
-                _, dark_mask = cv2.threshold(blue_gray, 100, 255, cv2.THRESH_BINARY_INV)
-                
-                # Combine SAM mask with dark threshold
-                combined_mask = cv2.bitwise_and(dark_mask, dark_mask, mask=best_mask.astype(np.uint8) * 255)
-                
-                # Find contours in the final mask
-                hole_contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                # Filter contours to find the most likely hole
-                hole_candidates = []
-                for contour in hole_contours:
-                    area = cv2.contourArea(contour)
-                    if 50 < area < 5000:
-                        perimeter = cv2.arcLength(contour, True)
-                        if perimeter > 0:
-                            circularity = 4 * np.pi * area / (perimeter * perimeter)
-                            if circularity > 0.6:
-                                M = cv2.moments(contour)
-                                if M["m00"] > 0:
-                                    hx = int(M["m10"] / M["m00"])
-                                    hy = int(M["m01"] / M["m00"])
-                                    hole_candidates.append((contour, circularity, (hx, hy)))
-                
-                if hole_candidates:
-                    # Sort by circularity (highest first)
-                    hole_candidates.sort(key=lambda x: x[1], reverse=True)
-                    best_hole = hole_candidates[0]
-                    return best_hole[2]  # Return the center coordinates
-                
-                # If no hole found, return center of blue object as fallback
-                return (cx, cy)
-                
-        except Exception as e:
-            self.get_logger().error(f"Error in SAM2 hole detection: {str(e)}")
-            # Fallback to traditional method
-            return self.detect_hole_in_blue_object(image)
-            
-        return (None, None)
 
     # Enhanced hole detection - combines color detection with contour analysis
     def detect_hole_in_blue_object(self, image: np.ndarray):
@@ -488,6 +362,177 @@ class PegAndHole(Node):
                 return (cx, cy)
         
         return (None, None)
+    
+
+    def find_contact_height(self, xy_pose, start_height, step_size=0.005, max_steps=40):
+        """
+        Gradually lower the end effector until contact with the block surface is detected.
+        
+        Args:
+            xy_pose: [x, y, initial_z, qx, qy, qz, qw] - The pose with x,y coordinates to use
+            start_height: The height to start from (should be safely above the surface)
+            step_size: How much to lower z each step in meters
+            max_steps: Maximum number of downward steps before giving up
+            
+        Returns:
+            tuple: (success, z_height) - Whether surface was found and the surface height
+        """
+        self.get_logger().info("FINDING BLOCK SURFACE HEIGHT USING FORCE FEEDBACK...")
+        
+        # Extract position and orientation
+        x, y = xy_pose[0], xy_pose[1]
+        qx, qy, qz, qw = xy_pose[3], xy_pose[4], xy_pose[5], xy_pose[6]
+        
+        # Start from a safe height
+        current_z = start_height
+        
+        for step in range(max_steps):
+            # Create pose at current height
+            test_pose = [x, y, current_z, qx, qy, qz, qw]
+            
+            # Move to test position
+            self.get_logger().info(f"TESTING HEIGHT Z={current_z:.4f}...")
+            self.publish_pose(test_pose)
+            time.sleep(0.5)  # Give time for motion and force reading
+            
+            # Check if contact with surface is detected (force above threshold)
+            if abs(self.FT_force_z) > self.surface_force_threshold:
+                self.get_logger().info(f"SURFACE CONTACT DETECTED AT Z={current_z:.4f}, FORCE_Z={self.FT_force_z:.2f}N")
+                # Move back up slightly for spiral search
+                surface_z = current_z + step_size
+                return True, surface_z
+            
+            # Lower position for next test
+            current_z -= step_size
+        
+        # If we reach here, we didn't detect the surface
+        self.get_logger().warn(f"NO SURFACE CONTACT DETECTED AFTER {max_steps} STEPS")
+        return False, None
+    
+    # Check if we're over the hole based on force feedback
+    def check_insertion_complete(self):
+        """
+        Check if we're positioned over the hole based on force feedback.
+        When over the hole, we should see LESS force than when on the surface.
+        
+        Returns:
+            bool: True if we're over the hole (low force), False if we're on surface (high force)
+        """
+        # Check if z-force is below the threshold (indicates hole)
+        if abs(self.FT_force_z) < self.hole_force_threshold:
+            self.get_logger().info(f"DETECTED LOW FORCE: {self.FT_force_z:.2f} N - LIKELY OVER HOLE")
+            return True
+        else:
+            self.get_logger().info(f"HIGH FORCE: {self.FT_force_z:.2f} N - STILL ON SURFACE")
+            return False
+
+    # Perform a spiral search pattern around a center point
+    def spiral_search(self, center_pose, surface_z, lift_height=0.05, max_radius=0.02, step_size=0.002, max_attempts=30):
+        """
+        Performs a spiral search pattern around a center point to find the hole.
+        For each point in the spiral:
+        1. Lifts up
+        2. Moves to the next position
+        3. Lowers down to the contact height
+        4. Checks if it's over a hole
+        
+        Args:
+            center_pose: The initial pose (center of the spiral) as [x, y, z, qx, qy, qz, qw]
+            surface_z: The z-coordinate of the detected surface
+            lift_height: How high to lift between moves
+            max_radius: Maximum radius of the spiral in meters
+            step_size: Step size between spiral points in meters
+            max_attempts: Maximum number of attempts before giving up
+            
+        Returns:
+            bool: True if hole was found, False otherwise
+        """
+        self.get_logger().info("STARTING IMPROVED SPIRAL SEARCH PATTERN FOR HOLE DETECTION...")
+        
+        # Extract position from the center pose
+        cx, cy, _ = center_pose[0], center_pose[1], center_pose[2]
+        
+        # Keep orientation the same
+        qx, qy, qz, qw = center_pose[3], center_pose[4], center_pose[5], center_pose[6]
+        
+        # Define the contact height (just 1mm above detected surface)
+        contact_z = surface_z + 0.001
+        
+        # Define lifted height (5cm above surface by default)
+        lifted_z = surface_z + lift_height
+        
+        # Try at the center position first
+        # 1. First move to lifted position above center
+        self.get_logger().info("MOVING TO LIFTED POSITION ABOVE CENTER...")
+        lifted_pose = [cx, cy, lifted_z, qx, qy, qz, qw]
+        self.publish_pose(lifted_pose)
+        time.sleep(1.0)
+        
+        # 2. Lower to contact height
+        self.get_logger().info("LOWERING TO CONTACT HEIGHT AT CENTER POSITION...")
+        contact_pose = [cx, cy, contact_z, qx, qy, qz, qw]
+        self.publish_pose(contact_pose)
+        time.sleep(1.0)
+        
+        # 3. Check if we're over the hole (indicated by LOW force)
+        if self.check_insertion_complete():
+            self.get_logger().info("HOLE FOUND AT CENTER POSITION!")
+            
+            # 4. Lower into the hole
+            self.get_logger().info("LOWERING INTO HOLE...")
+            insertion_pose = [cx, cy, contact_z - 0.05, qx, qy, qz, qw]  # Go 5cm down
+            self.publish_pose(insertion_pose)
+            time.sleep(2.0)
+            
+            return True
+        
+        # Start spiral search if initial attempt fails
+        angle = 0.0
+        radius = 0.0
+        
+        for i in range(max_attempts):
+            # Increase radius for next point in spiral
+            radius += step_size
+            
+            # Stop if we've reached the maximum radius
+            if radius > max_radius:
+                self.get_logger().warn(f"REACHED MAXIMUM SEARCH RADIUS ({max_radius} m) WITHOUT FINDING HOLE")
+                return False
+            
+            # Calculate next position in spiral pattern
+            angle += np.pi / 4  # 45 degree increment
+            dx = radius * np.cos(angle)
+            dy = radius * np.sin(angle)
+            
+            # 1. LIFT UP before moving laterally
+            self.get_logger().info(f"LIFTING UP TO MOVE TO NEXT POSITION...")
+            lifted_pose = [cx + dx, cy + dy, lifted_z, qx, qy, qz, qw]
+            self.publish_pose(lifted_pose)
+            time.sleep(1.0)
+            
+            # 2. LOWER DOWN to contact height at new position
+            self.get_logger().info(f"LOWERING TO CONTACT HEIGHT AT POSITION OFFSET: ({dx:.4f}, {dy:.4f})")
+            contact_pose = [cx + dx, cy + dy, contact_z, qx, qy, qz, qw]
+            self.publish_pose(contact_pose)
+            time.sleep(1.0)
+            
+            # 3. Check if we're over the hole at this position
+            if self.check_insertion_complete():
+                self.get_logger().info(f"HOLE FOUND AT POSITION OFFSET: ({dx:.4f}, {dy:.4f})")
+                
+                # 4. Lower into the hole
+                self.get_logger().info("LOWERING INTO HOLE...")
+                insertion_pose = [cx + dx, cy + dy, contact_z - 0.05, qx, qy, qz, qw]  # Go 5cm down
+                self.publish_pose(insertion_pose)
+                time.sleep(2.0)
+                
+                return True
+            
+            # If not over hole, lift up again before moving to next position
+            self.get_logger().info("NOT OVER HOLE, CONTINUING SEARCH...")
+        
+        self.get_logger().warn(f"SPIRAL SEARCH COMPLETED {max_attempts} ATTEMPTS WITHOUT FINDING HOLE")
+        return False
 
     # Coordinate transformation from image to camera in world frame
     def img_pixel_to_cam(self, pixel_coords, depth_m):
@@ -595,7 +640,7 @@ def main(args=None):
         rclpy.shutdown()
         return
     
-# Create poses for the motion sequence
+    # Create poses for the motion sequence
     # Position slightly above the cylinder
     pose_above_red = [
         world_coords_red[0, 0], 
@@ -617,14 +662,6 @@ def main(args=None):
         world_coords_hole[0, 0], 
         world_coords_hole[1, 0], 
         world_coords_hole[2, 0] + 0.30,  # 20cm above
-        1.0, 0.0, 0.0, 0.0
-    ]
-
-    # Position at the hole for placement
-    pose_hole = [
-        world_coords_hole[0, 0], 
-        world_coords_hole[1, 0], 
-        world_coords_hole[2, 0] + 0.20,  # Position for placement, slightly above
         1.0, 0.0, 0.0, 0.0
     ]
     
@@ -655,22 +692,79 @@ def main(args=None):
     node.publish_pose(pose_above_hole)
     time.sleep(2)
     
-    # 6. Lower to the hole
-    node.get_logger().info("Lowering to hole...")
-    node.publish_pose(pose_hole)
-    time.sleep(2)
+    # Force feedback to detect the surface height
+    # 6. Find the surface height of the block using force feedback
+    node.get_logger().info("FINDING BLOCK SURFACE HEIGHT USING FORCE FEEDBACK...")
+    # Create a starting pose for height detection
+    surface_detection_pose = [
+        world_coords_hole[0, 0],
+        world_coords_hole[1, 0],
+        world_coords_hole[2, 0] + 0.15,  # Start 15cm above estimated position
+        1.0, 0.0, 0.0, 0.0
+    ]
     
-    # 7. Release the cylinder
+    surface_found, surface_z = node.find_contact_height(
+        surface_detection_pose, 
+        world_coords_hole[2, 0] + 0.15,  # Start height
+        step_size=0.005,  # 5mm steps
+        max_steps=40
+    )
+    
+    # Handle the case where surface was not found
+    if not surface_found:
+        node.get_logger().error("FAILED TO DETECT BLOCK SURFACE - ABORTING.")
+        # Release cylinder and return to start position
+        node.publish_gripper_position(0.0)
+        node.publish_pose(pose_above_hole)
+        time.sleep(2)
+        if node.init_arm_pose is not None:
+            node.publish_pose([
+                node.init_arm_pose.position.x,
+                node.init_arm_pose.position.y,
+                node.init_arm_pose.position.z,
+                node.init_arm_pose.orientation.x,
+                node.init_arm_pose.orientation.y,
+                node.init_arm_pose.orientation.z,
+                node.init_arm_pose.orientation.w
+            ])
+        node.destroy_node()
+        rclpy.shutdown()
+        return
+    
+    # Use the detected surface height for the spiral search
+    # 7. Set up starting pose for spiral search
+    node.get_logger().info(f"BLOCK SURFACE FOUND AT Z={surface_z:.4f}, STARTING SPIRAL SEARCH...")
+    
+    # Initial pose at center of hole location
+    center_pose = [
+        world_coords_hole[0, 0], 
+        world_coords_hole[1, 0], 
+        surface_z + 0.05,  # 5cm above surface for safety
+        1.0, 0.0, 0.0, 0.0
+    ]
+    
+    # 8. Perform improved spiral search for the hole
+    node.get_logger().info("STARTING IMPROVED SPIRAL SEARCH WITH LIFT-MOVE-LOWER APPROACH...")
+    hole_found = node.spiral_search(
+        center_pose,
+        surface_z,
+        lift_height=0.05,  # Lift 5cm between positions
+        max_radius=0.03,  # 3cm radius search
+        step_size=0.003,  # 3mm steps
+        max_attempts=40
+    )
+    
+    # 9. Release the cylinder (whether or not hole was found)
     node.get_logger().info("Releasing cylinder...")
     node.publish_gripper_position(0.0)  # Open gripper
     time.sleep(1)
     
-    # 8. Move back up
+    # 10. Move back up
     node.get_logger().info("Moving back up...")
     node.publish_pose(pose_above_hole)
     time.sleep(2)
     
-    # 9. Return to initial position
+    # 11. Return to initial position
     if node.init_arm_pose is not None:
         node.get_logger().info("Returning to initial position...")
         init_pose = [
@@ -684,7 +778,11 @@ def main(args=None):
         ]
         node.publish_pose(init_pose)
     
-    node.get_logger().info("Pick and place operation completed successfully!")
+    # ADDED SUCCESS REPORTING BASED ON HOLE DETECTION
+    if hole_found:
+        node.get_logger().info("PICK AND PLACE OPERATION COMPLETED SUCCESSFULLY! CYLINDER INSERTED INTO HOLE.")
+    else:
+        node.get_logger().warn("PICK AND PLACE OPERATION COMPLETED, BUT HOLE WAS NOT FOUND DURING SPIRAL SEARCH.")
     
     node.destroy_node()
     rclpy.shutdown()
