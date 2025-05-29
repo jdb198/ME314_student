@@ -19,9 +19,9 @@ from me314_msgs.msg import CommandQueue, CommandWrapper
 
 CAMERA_OFFSET = 0.058
 
-class PickAndPlace(Node):
+class DollarBill(Node):
     def __init__(self):
-        super().__init__('pickandplace_node')
+        super().__init__('dollarbill_node')
 
         self.bridge = CvBridge()
 
@@ -42,11 +42,22 @@ class PickAndPlace(Node):
         self.realsense_sub = self.create_subscription(Image, '/camera/realsense2_camera_node/color/image_raw', self.realsense_callback, 10)
         self.depth_sub = self.create_subscription(Image, '/camera/realsense2_camera_node/aligned_depth_to_color/image_raw', self.depth_callback, 10)
 
-        self.realsense_sub
-        self.depth_sub
+        # Force/Torque sensor for surface detection
+        self.FT_force_x = 0.0
+        self.FT_force_y = 0.0
+        self.FT_force_z = 0.0
+        self.FT_torque_x = 0.0
+        self.FT_torque_y = 0.0
+        self.FT_torque_z = 0.0
+        self.ft_ext_state_sub = self.create_subscription(WrenchStamped, '/xarm/uf_ftsensor_ext_states', self.ft_ext_state_cb, 10)
 
-        self.cube_center = None
-        self.cube_depth = None
+        # Execution state monitoring
+        self.arm_executing_sub = self.create_subscription(Bool, '/me314_xarm_is_executing', self.execution_state_callback, 10)
+        self.arm_executing = True
+
+        self.dollar_bill_center = None
+        self.dollar_bill_depth = None
+        self.dollar_bill_angle = None  # Orientation angle
         self.target_center = None
         self.target_depth = None
 
@@ -56,6 +67,9 @@ class PickAndPlace(Node):
 
         self.found = False
         self.gotDepth = False
+
+        # Force thresholds
+        self.surface_force_threshold = 1.5  # Threshold for table contact detection
 
     def arm_pose_callback(self, msg: Pose):
         self.current_arm_pose = msg
@@ -116,22 +130,29 @@ class PickAndPlace(Node):
         
         self.get_logger().info(f"Published gripper command to queue: {gripper_pos:.2f}")
 
+    def ft_ext_state_cb(self, msg: WrenchStamped):
+        """Callback for force/torque sensor data"""
+        self.FT_force_x = msg.wrench.force.x
+        self.FT_force_y = msg.wrench.force.y
+        self.FT_force_z = msg.wrench.force.z
+        self.FT_torque_x = msg.wrench.torque.x
+        self.FT_torque_y = msg.wrench.torque.y
+        self.FT_torque_z = msg.wrench.torque.z
+
     # ---------------------------------------------------------------------
     #  NEW CODE
     # ---------------------------------------------------------------------
 
     def depth_callback(self, msg: Image):
-        if self.cube_center is None or self.target_center is None:
-            # Red box and green square not detected yet
+        if self.dollar_bill_center is None or self.target_center is None:
             return
         else:
-            # Both red box and green square detected
-            self.get_logger().info("Both red box and green square detected.")
+            self.get_logger().info("Both dollar bill and target detected.")
             aligned_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            rx, ry = self.cube_center
-            self.cube_depth = aligned_depth[ry, rx]  # Get depth at red box center
+            dx, dy = self.dollar_bill_center
+            self.dollar_bill_depth = aligned_depth[dy, dx]
             gx, gy = self.target_center
-            self.target_depth = aligned_depth[gy, gx]  # Get depth at green square center
+            self.target_depth = aligned_depth[gy, gx]
 
     def realsense_callback(self, msg: Image):
         if msg is None:
@@ -146,18 +167,17 @@ class PickAndPlace(Node):
         # 3) if both are found, set their coordinates
         # 4) if both are not found, raise camera return empty
 
-        if self.cube_center is None or self.target_center is None:
+        if self.dollar_bill_center is None or self.target_center is None:
             if self.current_arm_pose is not None:
-                # Raise the camera
                 pose = self.current_arm_pose
                 if self.init_arm_pose is None:
                     self.init_arm_pose = pose
 
-                # Extract position and orientation as a list and apply z-offset
+                # Raise camera to look for objects
                 new_pose = [
                     pose.position.x,
                     pose.position.y,
-                    pose.position.z + 0.1,  # New z coordinate
+                    pose.position.z + 0.1,
                     pose.orientation.x,
                     pose.orientation.y,
                     pose.orientation.z,
@@ -169,52 +189,82 @@ class PickAndPlace(Node):
 
                 cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
 
-                # Mask for red and green objects
-                masked_image_red, red_center = self.mask_red_object(cv_image)
+                # Look for dollar bill and target
+                masked_image_dollar, dollar_center, dollar_angle = self.mask_dollar_bill(cv_image)
                 masked_image_green, green_center = self.mask_green_object(cv_image)
                 
-                if red_center != (None, None):
-                    self.get_logger().info(f"Found red object at: {red_center}")
-                    self.cube_center = red_center
+                if dollar_center != (None, None):
+                    self.get_logger().info(f"Found dollar bill at: {dollar_center}, angle: {dollar_angle:.1f}°")
+                    self.dollar_bill_center = dollar_center
+                    self.dollar_bill_angle = dollar_angle
 
                 if green_center != (None, None):
-                    self.get_logger().info(f"Found green object at: {green_center}")
+                    self.get_logger().info(f"Found target at: {green_center}")
                     self.target_center = green_center
 
-    def mask_red_object(self, image: np.ndarray):
 
+    def mask_dollar_bill(self, image: np.ndarray):
+        """
+        Detect dollar bill using darker green color detection and determine its orientation.
+        Returns the annotated image, center coordinates, and orientation angle.
+        """
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
 
-        lower_red1 = np.array([0, 100, 100])
-        upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([160, 100, 100])
-        upper_red2 = np.array([180, 255, 255])
+        # Darker green range for fake dollar bill
+        lower_green = np.array([35, 50, 20])   # Darker, less saturated green
+        upper_green = np.array([85, 180, 120])  # Allow for various lighting conditions
 
-        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-        red_mask = cv2.bitwise_or(mask1, mask2)
+        mask = cv2.inRange(hsv, lower_green, upper_green)
 
-        red_mask = cv2.erode(red_mask, None, iterations=2)
-        red_mask = cv2.dilate(red_mask, None, iterations=2)
+        # Morphological operations to clean the mask
+        mask = cv2.erode(mask, None, iterations=2)
+        mask = cv2.dilate(mask, None, iterations=2)
 
-        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
-            return image, (None, None)
-        else:
-            largest = max(contours, key=cv2.contourArea)
-            M = cv2.moments(largest)
-            if M["m00"] == 0:
-                return image, (None, None)
+            return image, (None, None), None
+        
+        # Find the largest contour (should be the dollar bill)
+        largest = max(contours, key=cv2.contourArea)
+        
+        # Get minimum area rectangle to determine orientation
+        rect = cv2.minAreaRect(largest)
+        box = cv2.boxPoints(rect)
+        box = np.int0(box)
+        
+        # Calculate center
+        M = cv2.moments(largest)
+        if M["m00"] == 0:
+            return image, (None, None), None
 
-            # Calculate center
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
 
-            # Annotate image
-            result = image.copy()
-            cv2.circle(result, (cx, cy), 5, (0, 255, 0), -1)
-            return result, (cx, cy)
+        # Get the angle of the rectangle (orientation of dollar bill)
+        angle = rect[2]
+        
+        # Adjust angle to represent rotation from horizontal
+        # OpenCV's angle is between -90 and 0 degrees
+        if rect[1][0] < rect[1][1]:  # width < height
+            angle += 90
+            
+        # Normalize angle to 0-180 range
+        if angle < 0:
+            angle += 180
+
+        # Annotate image
+        result = image.copy()
+        cv2.drawContours(result, [box], 0, (0, 255, 255), 2)  # Yellow rectangle
+        cv2.circle(result, (cx, cy), 5, (255, 0, 0), -1)  # Red center dot
+        
+        # Draw orientation line
+        length = 50
+        end_x = int(cx + length * np.cos(np.radians(angle)))
+        end_y = int(cy + length * np.sin(np.radians(angle)))
+        cv2.line(result, (cx, cy), (end_x, end_y), (255, 0, 255), 2)  # Magenta line
+
+        return result, (cx, cy), angle
 
     def mask_green_object(self, image: np.ndarray):
         """
@@ -251,6 +301,101 @@ class PickAndPlace(Node):
         # cv2.drawContours(result, [largest_contour], -1, (0, 255, 0), 2)  # Green contour
         cv2.circle(result, (cx, cy), 5, (0, 0, 255), -1)  # Green center dot
         return result, (cx, cy)
+    
+    def find_surface_contact(self, xy_pose, start_height, step_size=0.002, max_steps=50):
+        """
+        Gradually lower the gripper until contact with table surface is detected.
+        Returns (success, contact_z_height)
+        """
+        self.get_logger().info("FINDING TABLE SURFACE HEIGHT USING FORCE FEEDBACK...")
+        
+        x, y = xy_pose[0], xy_pose[1]
+        qx, qy, qz, qw = xy_pose[3], xy_pose[4], xy_pose[5], xy_pose[6]
+        
+        current_z = start_height
+        
+        for step in range(max_steps):
+            test_pose = [x, y, current_z, qx, qy, qz, qw]
+            
+            self.get_logger().info(f"Testing height Z={current_z:.4f}...")
+            self.publish_pose(test_pose)
+            
+            # Wait for movement and force reading
+            time.sleep(0.3)
+            
+            # Check for contact with table (force above threshold)
+            if abs(self.FT_force_z) > self.surface_force_threshold:
+                self.get_logger().info(f"TABLE CONTACT DETECTED AT Z={current_z:.4f}, FORCE_Z={self.FT_force_z:.2f}N")
+                return True, current_z
+            
+            current_z -= step_size
+        
+        self.get_logger().warn(f"NO TABLE CONTACT DETECTED AFTER {max_steps} STEPS")
+        return False, None
+    
+    def rapid_grasp_and_lift(self, grasp_pose, lift_height=0.1):
+        """
+        Rapidly close gripper and lift to avoid crushing sensors on table.
+        This is a coordinated motion to grasp the dollar bill effectively.
+        """
+        self.get_logger().info("EXECUTING RAPID GRASP AND LIFT...")
+        
+        # Start grasping motion
+        self.get_logger().info("Starting to close gripper...")
+        self.publish_gripper_position(0.6)  # Close gripper partway
+        
+        # Small delay to let gripper start closing
+        time.sleep(0.2)
+        
+        # Immediately start lifting while gripper is still closing
+        lift_pose = [
+            grasp_pose[0],
+            grasp_pose[1], 
+            grasp_pose[2] + lift_height,
+            grasp_pose[3],
+            grasp_pose[4],
+            grasp_pose[5],
+            grasp_pose[6]
+        ]
+        
+        self.get_logger().info("Lifting while grasping...")
+        self.publish_pose(lift_pose)
+        
+        # Continue closing gripper while lifting
+        time.sleep(0.3)
+        self.publish_gripper_position(0.8)  # Close more firmly
+        
+        time.sleep(1.0)  # Wait for coordinated motion to complete
+        
+        self.get_logger().info("RAPID GRASP AND LIFT COMPLETED")
+
+    def create_oriented_pose(self, world_coords, angle_degrees):
+        """
+        Create a pose that aligns the gripper with the long side of the dollar bill.
+        """
+        # Convert angle to radians
+        angle_rad = np.radians(angle_degrees)
+        
+        # Create rotation around Z-axis to align with dollar bill orientation
+        # We want to rotate the gripper to be parallel to the long side
+        rotation = R.from_euler('z', angle_rad)
+        
+        # Base orientation (pointing down)
+        base_quat = R.from_euler('xyz', [np.pi, 0, 0])  # Point gripper down
+        
+        # Combine rotations
+        final_rotation = rotation * base_quat
+        final_quat = final_rotation.as_quat()  # [x, y, z, w]
+        
+        return [
+            world_coords[0, 0],
+            world_coords[1, 0], 
+            world_coords[2, 0],
+            final_quat[0],  # qx
+            final_quat[1],  # qy  
+            final_quat[2],  # qz
+            final_quat[3]   # qw
+        ]
 
     # Coordinate transformation from image to camera in world frame
     def img_pixel_to_cam(self, pixel_coords, depth_m):
@@ -313,72 +458,98 @@ class PickAndPlace(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PickAndPlace()
+    node = DollarBill()
 
+    # Wait until both objects are found and depth is available
     while not node.found or not node.gotDepth:
         rclpy.spin_once(node)
-        if node.cube_center is not None and node.target_center is not None:
+        if node.dollar_bill_center is not None and node.target_center is not None:
             node.found = True
-        if node.cube_depth is not None and node.target_depth is not None:
+        if node.dollar_bill_depth is not None and node.target_depth is not None:
             node.gotDepth = True
 
     node.get_logger().info("Opening gripper...")
     node.publish_gripper_position(0.0)
 
-    # Convert pixel coords + depth to camera coordinates
-    # camera_coords = self.img_pixel_to_cam(self.center_coordinates, depth_at_center_m)
-    camera_coords_red = node.img_pixel_to_cam(node.cube_center, node.cube_depth/1000.0)
-    camera_coords_green = node.img_pixel_to_cam(node.target_center, node.target_depth/1000.0)
-    # Transform camera coords to the robot arm frame
-    world_coords_red = node.camera_to_base_tf(camera_coords_red, 'camera_color_optical_frame')
-    world_coords_green = node.camera_to_base_tf(camera_coords_green, 'camera_color_optical_frame')
-    node.get_logger().info(f"Red world coords: {world_coords_red}")
-    node.get_logger().info(f"Green world coords: {world_coords_green}")
+    # Convert pixel coordinates to world coordinates
+    camera_coords_dollar = node.img_pixel_to_cam(node.dollar_bill_center, node.dollar_bill_depth/1000.0)
+    camera_coords_target = node.img_pixel_to_cam(node.target_center, node.target_depth/1000.0)
+    
+    world_coords_dollar = node.camera_to_base_tf(camera_coords_dollar, 'camera_color_optical_frame')
+    world_coords_target = node.camera_to_base_tf(camera_coords_target, 'camera_color_optical_frame')
+    
+    node.get_logger().info(f"Dollar bill world coords: {world_coords_dollar}")
+    node.get_logger().info(f"Target world coords: {world_coords_target}")
+    node.get_logger().info(f"Dollar bill orientation: {node.dollar_bill_angle:.1f}°")
 
-    # Create pose for red box
-    pose_above_red = [world_coords_red[0, 0], world_coords_red[1, 0], world_coords_red[2, 0] + 0.1,
-                1.0, 0.0, 0.0, 0.0]  # Assuming no rotation needed
-    pose_red = [world_coords_red[0, 0], world_coords_red[1, 0], world_coords_red[2, 0] + 0.05,
-                1.0, 0.0, 0.0, 0.0]  # Assuming no rotation needed
-    node.get_logger().info(f"Red box pose: {pose_red}")
+    # Create oriented pose aligned with dollar bill's long side
+    oriented_pose_above = node.create_oriented_pose(world_coords_dollar, node.dollar_bill_angle)
+    oriented_pose_above[2] += 0.15  # 15cm above for approach
 
-    node.get_logger().info(f"Going above cube...")
-    node.publish_pose(pose_above_red)
+    # Move above dollar bill with correct orientation
+    node.get_logger().info("Moving above dollar bill with correct orientation...")
+    node.publish_pose(oriented_pose_above)
+    time.sleep(2)
 
-    node.get_logger().info(f"Lowering to cube...")
-    node.publish_pose(pose_red)
+    # Find table surface using force feedback
+    node.get_logger().info("Detecting table surface...")
+    surface_found, surface_z = node.find_surface_contact(
+        oriented_pose_above, 
+        world_coords_dollar[2, 0] + 0.1,  # Start 10cm above estimated position
+        step_size=0.002,  # 2mm steps for precision
+        max_steps=50
+    )
 
-    # Now close the gripper.
-    node.get_logger().info("Closing gripper...")
-    node.publish_gripper_position(0.75)
+    if not surface_found:
+        node.get_logger().error("Failed to detect table surface - aborting operation.")
+        node.publish_gripper_position(0.0)
+        time.sleep(1)
+        if node.init_arm_pose is not None:
+            init_pose = [
+                node.init_arm_pose.position.x, node.init_arm_pose.position.y, node.init_arm_pose.position.z,
+                node.init_arm_pose.orientation.x, node.init_arm_pose.orientation.y, 
+                node.init_arm_pose.orientation.z, node.init_arm_pose.orientation.w
+            ]
+            node.publish_pose(init_pose)
+        node.destroy_node()
+        rclpy.shutdown()
+        return
 
-    node.get_logger().info(f"Moving cube up...")
-    node.publish_pose(pose_above_red)
+    # Create grasp pose at detected surface height
+    grasp_pose = node.create_oriented_pose(world_coords_dollar, node.dollar_bill_angle)
+    grasp_pose[2] = surface_z + 0.002  # Just 2mm above surface to touch dollar bill
 
-    # Move the arm to the green square
-    pose_green = [world_coords_green[0, 0], world_coords_green[1, 0], world_coords_green[2, 0] + 0.1,
-                  1.0, 0.0, 0.0, 0.0]  # Assuming no rotation needed
-    node.get_logger().info(f"Green square pose: {pose_green}")
+    node.get_logger().info(f"Moving to grasp position at surface height: {surface_z:.4f}")
+    node.publish_pose(grasp_pose)
+    time.sleep(1)
 
-    node.get_logger().info(f"Going to green target...")
-    node.publish_pose(pose_green)
+    # Execute rapid grasp and lift
+    node.rapid_grasp_and_lift(grasp_pose, lift_height=0.1)
 
-    node.get_logger().info("Opening gripper...")
+    # Move to target location
+    target_pose = [world_coords_target[0, 0], world_coords_target[1, 0], world_coords_target[2, 0] + 0.1,
+                   1.0, 0.0, 0.0, 0.0]
+    
+    node.get_logger().info("Moving to target location...")
+    node.publish_pose(target_pose)
+    time.sleep(2)
+
+    # Release dollar bill
+    node.get_logger().info("Releasing dollar bill...")
     node.publish_gripper_position(0.0)
+    time.sleep(1)
 
-    node.get_logger().info("Moving back to initial position...")
-    init_pose = [
-                    node.init_arm_pose.position.x,
-                    node.init_arm_pose.position.y,
-                    node.init_arm_pose.position.z,
-                    node.init_arm_pose.orientation.x,
-                    node.init_arm_pose.orientation.y,
-                    node.init_arm_pose.orientation.z,
-                    node.init_arm_pose.orientation.w
-                ]
-    node.publish_pose(init_pose)
+    # Return to initial position
+    if node.init_arm_pose is not None:
+        node.get_logger().info("Returning to initial position...")
+        init_pose = [
+            node.init_arm_pose.position.x, node.init_arm_pose.position.y, node.init_arm_pose.position.z,
+            node.init_arm_pose.orientation.x, node.init_arm_pose.orientation.y, 
+            node.init_arm_pose.orientation.z, node.init_arm_pose.orientation.w
+        ]
+        node.publish_pose(init_pose)
 
-    node.get_logger().info("Pick and place done. Shutting down.")
+    node.get_logger().info("Dollar bill pickup completed successfully!")
     node.destroy_node()
     rclpy.shutdown()
 
