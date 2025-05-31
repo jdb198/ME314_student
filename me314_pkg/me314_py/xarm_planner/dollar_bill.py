@@ -70,10 +70,6 @@ class DollarBill(Node):
         # Force thresholds
         self.surface_force_threshold = 1.0  # Threshold for table contact detection
 
-        self.detection_stable = False  
-        self.camera_raised = False     
-        self.detection_count = 0       
-
     def arm_pose_callback(self, msg: Pose):
         self.current_arm_pose = msg
 
@@ -152,40 +148,13 @@ class DollarBill(Node):
     def depth_callback(self, msg: Image):
         if self.dollar_bill_center is None or self.target_center is None:
             return
-            
-        try:
-            self.get_logger().info("Both dollar bill and target detected, acquiring depth...")
+        else:
+            self.get_logger().info("Both dollar bill and target detected.")
             aligned_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            
             dx, dy = self.dollar_bill_center
+            self.dollar_bill_depth = aligned_depth[dy, dx]
             gx, gy = self.target_center
-            
-            # Check bounds before accessing depth values
-            height, width = aligned_depth.shape
-            if 0 <= dx < width and 0 <= dy < height:
-                self.dollar_bill_depth = aligned_depth[dy, dx]
-                self.get_logger().info(f"Dollar bill depth: {self.dollar_bill_depth}")
-            else:
-                self.get_logger().warn(f"Dollar bill center out of bounds: ({dx}, {dy})")
-                return
-                
-            if 0 <= gx < width and 0 <= gy < height:
-                self.target_depth = aligned_depth[gy, gx]
-                self.get_logger().info(f"Target depth: {self.target_depth}")
-            else:
-                self.get_logger().warn(f"Target center out of bounds: ({gx}, {gy})")
-                return
-                
-            # Only set gotDepth if both depths are valid (not 0 or NaN)
-            if (self.dollar_bill_depth > 0 and self.target_depth > 0 and 
-                not np.isnan(self.dollar_bill_depth) and not np.isnan(self.target_depth)):
-                self.gotDepth = True
-                self.get_logger().info(f"Valid depths acquired - Dollar: {self.dollar_bill_depth}, Target: {self.target_depth}")
-            else:
-                self.get_logger().warn(f"Invalid depth values - Dollar: {self.dollar_bill_depth}, Target: {self.target_depth}")
-                
-        except Exception as e:
-            self.get_logger().error(f"Error in depth callback: {str(e)}")
+            self.target_depth = aligned_depth[gy, gx]
 
     def realsense_callback(self, msg: Image):
         if msg is None:
@@ -200,36 +169,8 @@ class DollarBill(Node):
         # 3) if both are found, set their coordinates
         # 4) if both are not found, raise camera return empty
 
-        # If we already have stable detection, don't keep processing
-        if self.detection_stable:
-            return
-
-        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
-
-        # Look for dollar bill and target
-        masked_image_dollar, dollar_center, dollar_angle = self.mask_dollar_bill(cv_image)
-        masked_image_green, green_center = self.mask_green_object(cv_image)
-        
-        # Check if both objects were detected
-        both_detected = (dollar_center != (None, None) and green_center != (None, None))
-        
-        if both_detected:
-            self.get_logger().info(f"Found dollar bill at: {dollar_center}, angle: {dollar_angle:.1f}°")
-            self.get_logger().info(f"Found target at: {green_center}")
-            
-            self.dollar_bill_center = dollar_center
-            self.dollar_bill_angle = dollar_angle
-            self.target_center = green_center
-            self.detection_count += 1
-            
-            # Consider detection stable after 3 successful detections
-            if self.detection_count >= 3:
-                self.found = True
-                self.detection_stable = True
-                self.get_logger().info("Detection stabilized!")
-        else:
-            # If objects not found and camera hasn't been raised yet
-            if not self.camera_raised and self.current_arm_pose is not None:
+        if self.dollar_bill_center is None or self.target_center is None:
+            if self.current_arm_pose is not None:
                 pose = self.current_arm_pose
                 if self.init_arm_pose is None:
                     self.init_arm_pose = pose
@@ -246,11 +187,22 @@ class DollarBill(Node):
                 ]
 
                 self.publish_pose(new_pose)
-                self.camera_raised = True
                 self.get_logger().info("Raising camera to look for objects...")
+
+                cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
+
+                # Look for dollar bill and target
+                masked_image_dollar, dollar_center, dollar_angle = self.mask_dollar_bill(cv_image)
+                masked_image_green, green_center = self.mask_green_object(cv_image)
                 
-            # Reset detection count if objects are lost
-            self.detection_count = 0
+                if dollar_center != (None, None):
+                    self.get_logger().info(f"Found dollar bill at: {dollar_center}, angle: {dollar_angle:.1f}°")
+                    self.dollar_bill_center = dollar_center
+                    self.dollar_bill_angle = dollar_angle
+
+                if green_center != (None, None):
+                    self.get_logger().info(f"Found target at: {green_center}")
+                    self.target_center = green_center
 
 
     def mask_dollar_bill(self, image: np.ndarray):
@@ -259,13 +211,18 @@ class DollarBill(Node):
         Returns the annotated image, center coordinates, and orientation angle.
         """
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        #cv2.imwrite("test.jpg", bgr)
+        #cv2.imshow("bgr im", bgr)
 
         # Darker green range for fake dollar bill
-        lower_green = np.array([35, 50, 20])   # Darker, less saturated green
-        upper_green = np.array([85, 180, 120])  # Allow for various lighting conditions
+        lower_green = np.array([9, 33, 20])   # Darker, less saturated green
+        upper_green = np.array([50, 160, 175])  # Allow for various lighting conditions
 
         mask = cv2.inRange(hsv, lower_green, upper_green)
 
+        #cv2.imshow("mask for dollar bill", mask)
+        #cv2.waitKey(0)
         # Morphological operations to clean the mask
         mask = cv2.erode(mask, None, iterations=2)
         mask = cv2.dilate(mask, None, iterations=2)
@@ -371,8 +328,12 @@ class DollarBill(Node):
             self.publish_pose(test_pose)
             
             # Wait for movement and force reading
-            time.sleep(0.3)
-            
+            cur_time = time.time()
+
+            while time.time() - cur_time < 0.3:
+                rclpy.spin_once(self)
+
+            print(self.FT_force_z)
             # Check for contact with table (force above threshold)
             if abs(self.FT_force_z) > self.surface_force_threshold:
                 self.get_logger().info(f"TABLE CONTACT DETECTED AT Z={current_z:.4f}, FORCE_Z={self.FT_force_z:.2f}N")
@@ -392,7 +353,7 @@ class DollarBill(Node):
         self.get_logger().info("EXECUTING COORDINATED GRASP AND LIFT...")
         
         # Parameters for coordinated motion
-        height_increment = 0.002  # 2mm per step
+        height_increment = 0.007  # 7mm per step
         gripper_increment = 0.01  # Gripper closing increment
         target_gripper_pos = 0.974  # Final gripper position
         
@@ -401,7 +362,7 @@ class DollarBill(Node):
         gripper_steps = int(target_gripper_pos / gripper_increment)  # e.g., 0.8 / 0.01 = 80 steps
         
         # Use the larger number of steps for smoother motion
-        num_steps = max(height_steps, gripper_steps)
+        num_steps = 4
         
         # Recalculate increments to distribute evenly over num_steps
         actual_height_increment = lift_height / num_steps
@@ -446,10 +407,15 @@ class DollarBill(Node):
                                        f"gripper={current_gripper_pos:.2f}")
             
             # Small delay between steps for smooth motion
-            time.sleep(0.05)  # 50ms delay per step
+            current_time = time.time()
+            
+            while time.time() - current_time < 0.5:
+                rclpy.spin_once(self)
         
         # Final hold to ensure motion completes
-        time.sleep(0.5)
+        current_time = time.time()
+        while time.time() - current_time < 0.5:
+                rclpy.spin_once(self)
         
         self.get_logger().info("COORDINATED GRASP AND LIFT COMPLETED")
 
@@ -541,130 +507,107 @@ class DollarBill(Node):
         return matrix
 
 def main(args=None):
-        rclpy.init(args=args)
+    rclpy.init(args=args)
     node = DollarBill()
 
-    # Wait until both objects are found and depth is available with timeout
-    timeout_seconds = 10.0  # 10 second timeout
-    start_time = time.time()
-    
-    node.get_logger().info("Waiting for object detection and depth acquisition...")
-    
-    while not (node.found and node.gotDepth):
-        if time.time() - start_time > timeout_seconds:
-            node.get_logger().error("Timeout waiting for object detection and depth acquisition!")
-            node.destroy_node()
-            rclpy.shutdown()
-            return
-            
-        rclpy.spin_once(node, timeout_sec=0.1)
-        
-        # Log current status every 2 seconds
-        if int(time.time() - start_time) % 2 == 0:
-            node.get_logger().info(f"Status - Found: {node.found}, Got Depth: {node.gotDepth}, "
-                                 f"Detection count: {node.detection_count}")
-    
-    node.get_logger().info("Both objects detected and depth acquired! Starting manipulation...")
+    # Wait until both objects are found and depth is available
+    while not node.found or not node.gotDepth:
+        rclpy.spin_once(node)
+        if node.dollar_bill_center is not None and node.target_center is not None:
+            node.found = True
+        if node.dollar_bill_depth is not None and node.target_depth is not None:
+            node.gotDepth = True
 
     node.get_logger().info("Opening gripper...")
     node.publish_gripper_position(0.0)
-    time.sleep(1)  # Wait for gripper to open
 
     # Convert pixel coordinates to world coordinates
-    try:
-        camera_coords_dollar = node.img_pixel_to_cam(node.dollar_bill_center, node.dollar_bill_depth/1000.0)
-        camera_coords_target = node.img_pixel_to_cam(node.target_center, node.target_depth/1000.0)
-        
-        world_coords_dollar = node.camera_to_base_tf(camera_coords_dollar, 'camera_color_optical_frame')
-        world_coords_target = node.camera_to_base_tf(camera_coords_target, 'camera_color_optical_frame')
-        
-        if world_coords_dollar is None or world_coords_target is None:
-            node.get_logger().error("Failed to transform coordinates to world frame!")
-            node.destroy_node()
-            rclpy.shutdown()
-            return
+    camera_coords_dollar = node.img_pixel_to_cam(node.dollar_bill_center, node.dollar_bill_depth/1000.0)
+    camera_coords_target = node.img_pixel_to_cam(node.target_center, node.target_depth/1000.0)
+    #current_time = time.time()
             
-        node.get_logger().info(f"Dollar bill world coords: {world_coords_dollar}")
-        node.get_logger().info(f"Target world coords: {world_coords_target}")
-        node.get_logger().info(f"Dollar bill orientation: {node.dollar_bill_angle:.1f}°")
+    #while time.time() - current_time < 5.0:
+    #    rclpy.spin_once(node)
+    node.get_logger().info(f"Dollar bill camera coords: {camera_coords_dollar}")
+    node.get_logger().info(f"Target camera coords: {camera_coords_target}")
 
-        # [Rest of the manipulation code remains the same...]
+    world_coords_dollar = node.camera_to_base_tf(camera_coords_dollar, 'camera_color_optical_frame')
+    world_coords_target = node.camera_to_base_tf(camera_coords_target, 'camera_color_optical_frame')
+    
+    node.get_logger().info(f"Dollar bill world coords: {world_coords_dollar}")
+    node.get_logger().info(f"Target world coords: {world_coords_target}")
+    node.get_logger().info(f"Dollar bill orientation: {node.dollar_bill_angle:.1f}°")
+
+    # Create oriented pose aligned with dollar bill's long side
+    oriented_pose_above = node.create_oriented_pose(world_coords_dollar, node.dollar_bill_angle)
+    oriented_pose_above[2] += 0.15  # 15cm above for approach
         
-        # Create oriented pose aligned with dollar bill's long side
-        oriented_pose_above = node.create_oriented_pose(world_coords_dollar, node.dollar_bill_angle)
-        oriented_pose_above[2] += 0.15  # 15cm above for approach
+    # Move above dollar bill with correct orientation
+    node.get_logger().info("Moving above dollar bill with correct orientation...")
+    node.publish_pose(oriented_pose_above)
+    time.sleep(20)
 
-        # Move above dollar bill with correct orientation
-        node.get_logger().info("Moving above dollar bill with correct orientation...")
-        node.publish_pose(oriented_pose_above)
-        time.sleep(2)
+    # Find table surface using force feedback
+    node.get_logger().info("Detecting table surface...")
+    surface_found, surface_z = node.find_surface_contact(
+        oriented_pose_above, 
+        world_coords_dollar[2, 0] + 0.1,  # Start 10cm above estimated position
+        step_size=0.001,  # 2mm steps for precision
+        max_steps=50
+    )
 
-        # Find table surface using force feedback
-        node.get_logger().info("Detecting table surface...")
-        surface_found, surface_z = node.find_surface_contact(
-            oriented_pose_above, 
-            world_coords_dollar[2, 0] + 0.1,
-            step_size=0.002,
-            max_steps=50
-        )
-
-        if not surface_found:
-            node.get_logger().error("Failed to detect table surface - aborting operation.")
-            node.publish_gripper_position(0.0)
-            time.sleep(1)
-            if node.init_arm_pose is not None:
-                init_pose = [
-                    node.init_arm_pose.position.x, node.init_arm_pose.position.y, node.init_arm_pose.position.z,
-                    node.init_arm_pose.orientation.x, node.init_arm_pose.orientation.y, 
-                    node.init_arm_pose.orientation.z, node.init_arm_pose.orientation.w
-                ]
-                node.publish_pose(init_pose)
-            node.destroy_node()
-            rclpy.shutdown()
-            return
-
-        # Create grasp pose at detected surface height
-        grasp_pose = node.create_oriented_pose(world_coords_dollar, node.dollar_bill_angle)
-        grasp_pose[2] = surface_z + 0.002
-
-        node.get_logger().info(f"Moving to grasp position at surface height: {surface_z:.4f}")
-        node.publish_pose(grasp_pose)
-        time.sleep(1)
-
-        # Execute rapid grasp and lift
-        node.rapid_grasp_and_lift(grasp_pose, lift_height=0.1)
-
-        # Move to target location
-        target_pose = [world_coords_target[0, 0], world_coords_target[1, 0], world_coords_target[2, 0] + 0.1,
-                       1.0, 0.0, 0.0, 0.0]
-        
-        node.get_logger().info("Moving to target location...")
-        node.publish_pose(target_pose)
-        time.sleep(2)
-
-        # Release dollar bill
-        node.get_logger().info("Releasing dollar bill...")
+    if not surface_found:
+        node.get_logger().error("Failed to detect table surface - aborting operation.")
         node.publish_gripper_position(0.0)
         time.sleep(1)
-
-        # Return to initial position
         if node.init_arm_pose is not None:
-            node.get_logger().info("Returning to initial position...")
             init_pose = [
                 node.init_arm_pose.position.x, node.init_arm_pose.position.y, node.init_arm_pose.position.z,
                 node.init_arm_pose.orientation.x, node.init_arm_pose.orientation.y, 
                 node.init_arm_pose.orientation.z, node.init_arm_pose.orientation.w
             ]
             node.publish_pose(init_pose)
-
-        node.get_logger().info("Dollar bill pickup completed successfully!")
-        
-    except Exception as e:
-        node.get_logger().error(f"Error during manipulation: {str(e)}")
-    
-    finally:
         node.destroy_node()
         rclpy.shutdown()
+        return
+
+    # Create grasp pose at detected surface height
+    grasp_pose = node.create_oriented_pose(world_coords_dollar, node.dollar_bill_angle)
+    grasp_pose[2] = surface_z + 0.002  # Just 2mm above surface to touch dollar bill
+
+    node.get_logger().info(f"Moving to grasp position at surface height: {surface_z:.4f}")
+    node.publish_pose(grasp_pose)
+    time.sleep(1)
+
+    # Execute rapid grasp and lift
+    node.rapid_grasp_and_lift(grasp_pose, lift_height=0.1)
+
+    # Move to target location
+    target_pose = [world_coords_target[0, 0], world_coords_target[1, 0], world_coords_target[2, 0] + 0.1,
+                   1.0, 0.0, 0.0, 0.0]
+    
+    node.get_logger().info("Moving to target location...")
+    node.publish_pose(target_pose)
+    time.sleep(2)
+
+    # Release dollar bill
+    node.get_logger().info("Releasing dollar bill...")
+    node.publish_gripper_position(0.0)
+    time.sleep(1)
+
+    # Return to initial position
+    if node.init_arm_pose is not None:
+        node.get_logger().info("Returning to initial position...")
+        init_pose = [
+            node.init_arm_pose.position.x, node.init_arm_pose.position.y, node.init_arm_pose.position.z,
+            node.init_arm_pose.orientation.x, node.init_arm_pose.orientation.y, 
+            node.init_arm_pose.orientation.z, node.init_arm_pose.orientation.w
+        ]
+        node.publish_pose(init_pose)
+
+    node.get_logger().info("Dollar bill pickup completed successfully!")
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
