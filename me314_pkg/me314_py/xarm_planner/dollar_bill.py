@@ -50,7 +50,7 @@ class DollarBill(Node):
         self.FT_torque_z = 0.0
         self.ft_ext_state_sub = self.create_subscription(WrenchStamped, '/xarm/uf_ftsensor_ext_states', self.ft_ext_state_cb, 10)
 
-        # Execution state monitoring
+        #Execution state monitoring
         self.arm_executing_sub = self.create_subscription(Bool, '/me314_xarm_is_executing', self.execution_state_callback, 10)
         self.arm_executing = True
 
@@ -142,6 +142,9 @@ class DollarBill(Node):
     #  NEW CODE
     # ---------------------------------------------------------------------
 
+    def execution_state_callback(self, msg: Bool):
+        self.arm_executing = msg.data
+
     def depth_callback(self, msg: Image):
         if self.dollar_bill_center is None or self.target_center is None:
             return
@@ -230,7 +233,7 @@ class DollarBill(Node):
         # Get minimum area rectangle to determine orientation
         rect = cv2.minAreaRect(largest)
         box = cv2.boxPoints(rect)
-        box = np.int0(box)
+        box = box.astype(int)
         
         # Calculate center
         M = cv2.moments(largest)
