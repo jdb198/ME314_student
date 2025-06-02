@@ -251,14 +251,26 @@ class DollarBill(Node):
         # Get the angle of the rectangle (orientation of dollar bill)
         angle = rect[2]
         
-        # Adjust angle to represent rotation from horizontal
-        # OpenCV's angle is between -90 and 0 degrees
-        if rect[1][0] < rect[1][1]:  # width < height
+        # OpenCV's minAreaRect returns angle between -90 and 0
+        # We want to map this to a -90 to 90 range properly
+        width, height = rect[1]
+        
+        if width < height:
+            # Rectangle is taller than wide, rotate by 90 degrees
             angle += 90
-            
-        # Normalize angle to 0-180 range
-        if angle < 0:
+        
+        # FIXED: Constrain angle to -90 to 90 range
+        while angle > 90:
+            angle -= 180
+        while angle < -90:
             angle += 180
+            
+        # Additional constraint to prevent large rotations
+        # If angle is close to ±90, prefer the smaller rotation
+        if angle > 45:
+            angle -= 90
+        elif angle < -45:
+            angle += 90
 
         # Annotate image
         result = image.copy()
@@ -344,36 +356,41 @@ class DollarBill(Node):
         self.get_logger().warn(f"NO TABLE CONTACT DETECTED AFTER {max_steps} STEPS")
         return False, None
     
+    def wait_for_execution_complete(self, timeout=10.0):
+        """Wait for the robot to finish executing current commands"""
+        start_time = time.time()
+        
+        # Wait a bit for execution to start
+        time.sleep(0.1)
+        
+        while self.arm_executing and (time.time() - start_time) < timeout:
+            rclpy.spin_once(self)
+            time.sleep(0.01)  # Small sleep to prevent busy waiting
+        
+        if self.arm_executing:
+            self.get_logger().warn(f"Execution timeout after {timeout}s")
+        else:
+            self.get_logger().info("Execution completed")
+    
     def rapid_grasp_and_lift(self, grasp_pose, lift_height=0.0127):
         """
-        Rapidly close gripper and lift to avoid crushing sensors on table.
-        This is a coordinated motion to grasp the dollar bill effectively.
-        Uses incremental lifting (2mm steps) coordinated with gripper closing (0.01 steps).
+        Rapidly close gripper and lift - LIMITED TO 6 CYCLES
         """
         self.get_logger().info("EXECUTING COORDINATED GRASP AND LIFT...")
         
-        # Parameters for coordinated motion
-        height_increment = 0.007  # 7mm per step
-        gripper_increment = 0.01  # Gripper closing increment
+        # FIXED: Cap at 6 cycles as requested
+        num_steps = 6
         target_gripper_pos = 0.974  # Final gripper position
         
-        # Calculate number of steps
-        height_steps = int(lift_height / height_increment)  # e.g., 100mm / 2mm = 50 steps
-        gripper_steps = int(target_gripper_pos / gripper_increment)  # e.g., 0.8 / 0.01 = 80 steps
-        
-        # Use the larger number of steps for smoother motion
-        num_steps = 4
-        
-        # Recalculate increments to distribute evenly over num_steps
+        # Calculate evenly spaced increments for 6 steps
         actual_height_increment = lift_height / num_steps
         actual_gripper_increment = target_gripper_pos / num_steps
         
         self.get_logger().info(f"Coordinated motion: {num_steps} steps, "
-                               f"height increment: {actual_height_increment*1000:.1f}mm, "
-                               f"gripper increment: {actual_gripper_increment:.3f}")
+                            f"height increment: {actual_height_increment*1000:.1f}mm, "
+                            f"gripper increment: {actual_gripper_increment:.3f}")
         
         # Starting positions
-        current_gripper_pos = 0.0
         start_z = grasp_pose[2]
         
         # Execute coordinated motion loop
@@ -387,35 +404,20 @@ class DollarBill(Node):
             
             # Create pose for current step
             current_pose = [
-                grasp_pose[0],
-                grasp_pose[1], 
-                current_height,
-                grasp_pose[3],
-                grasp_pose[4],
-                grasp_pose[5],
-                grasp_pose[6]
+                grasp_pose[0], grasp_pose[1], current_height,
+                grasp_pose[3], grasp_pose[4], grasp_pose[5], grasp_pose[6]
             ]
             
-            # Execute coordinated commands
+            # Execute commands and WAIT for completion
             self.publish_pose(current_pose)
             self.publish_gripper_position(current_gripper_pos)
             
-            # Log progress every 10 steps
-            if step % 10 == 0 or step == num_steps - 1:
-                self.get_logger().info(f"Step {step+1}/{num_steps}: "
-                                       f"height={current_height:.4f}m, "
-                                       f"gripper={current_gripper_pos:.2f}")
+            self.get_logger().info(f"Step {step+1}/{num_steps}: "
+                                f"height={current_height:.4f}m, "
+                                f"gripper={current_gripper_pos:.2f}")
             
-            # Small delay between steps for smooth motion
-            current_time = time.time()
-            
-            while time.time() - current_time < 0.5:
-                rclpy.spin_once(self)
-        
-        # Final hold to ensure motion completes
-        current_time = time.time()
-        while time.time() - current_time < 0.5:
-                rclpy.spin_once(self)
+            # FIXED: Actually wait for execution to complete
+            self.wait_for_execution_complete(timeout=5.0)
         
         self.get_logger().info("COORDINATED GRASP AND LIFT COMPLETED")
 
@@ -423,11 +425,10 @@ class DollarBill(Node):
         """
         Create a pose that aligns the gripper with the long side of the dollar bill.
         """
-        # Convert angle to radians
-        angle_rad = np.radians(angle_degrees)
+        # FIXED: If rotation direction is wrong, try negating the angle
+        angle_rad = np.radians(-angle_degrees)  # Note the negative sign
         
         # Create rotation around Z-axis to align with dollar bill orientation
-        # We want to rotate the gripper to be parallel to the long side
         rotation = R.from_euler('z', angle_rad)
         
         # Base orientation (pointing down)
@@ -520,14 +521,13 @@ def main(args=None):
 
     node.get_logger().info("Opening gripper...")
     node.publish_gripper_position(0.0)
+    # FIXED: Wait for gripper to actually open
+    node.wait_for_execution_complete(timeout=5.0)
 
     # Convert pixel coordinates to world coordinates
     camera_coords_dollar = node.img_pixel_to_cam(node.dollar_bill_center, node.dollar_bill_depth/1000.0)
     camera_coords_target = node.img_pixel_to_cam(node.target_center, node.target_depth/1000.0)
-    #current_time = time.time()
-            
-    #while time.time() - current_time < 5.0:
-    #    rclpy.spin_once(node)
+    
     node.get_logger().info(f"Dollar bill camera coords: {camera_coords_dollar}")
     node.get_logger().info(f"Target camera coords: {camera_coords_target}")
 
@@ -545,21 +545,23 @@ def main(args=None):
     # Move above dollar bill with correct orientation
     node.get_logger().info("Moving above dollar bill with correct orientation...")
     node.publish_pose(oriented_pose_above)
-    time.sleep(20)
+    # FIXED: Replace arbitrary 20 second sleep with proper execution waiting
+    node.wait_for_execution_complete(timeout=15.0)
 
     # Find table surface using force feedback
     node.get_logger().info("Detecting table surface...")
     surface_found, surface_z = node.find_surface_contact(
         oriented_pose_above, 
         world_coords_dollar[2, 0] + 0.1,  # Start 10cm above estimated position
-        step_size=0.001,  # 2mm steps for precision
+        step_size=0.001,  # 1mm steps for precision
         max_steps=50
     )
 
     if not surface_found:
         node.get_logger().error("Failed to detect table surface - aborting operation.")
         node.publish_gripper_position(0.0)
-        time.sleep(1)
+        node.wait_for_execution_complete(timeout=3.0)  # FIXED: Wait for gripper to open
+        
         if node.init_arm_pose is not None:
             init_pose = [
                 node.init_arm_pose.position.x, node.init_arm_pose.position.y, node.init_arm_pose.position.z,
@@ -567,6 +569,8 @@ def main(args=None):
                 node.init_arm_pose.orientation.z, node.init_arm_pose.orientation.w
             ]
             node.publish_pose(init_pose)
+            node.wait_for_execution_complete(timeout=10.0)  # FIXED: Wait for return to initial position
+        
         node.destroy_node()
         rclpy.shutdown()
         return
@@ -577,9 +581,10 @@ def main(args=None):
 
     node.get_logger().info(f"Moving to grasp position at surface height: {surface_z:.4f}")
     node.publish_pose(grasp_pose)
-    time.sleep(1)
+    # FIXED: Wait for movement to complete
+    node.wait_for_execution_complete(timeout=10.0)
 
-    # Execute rapid grasp and lift
+    # Execute rapid grasp and lift (already has proper waiting built-in)
     node.rapid_grasp_and_lift(grasp_pose, lift_height=0.1)
 
     # Move to target location
@@ -588,12 +593,14 @@ def main(args=None):
     
     node.get_logger().info("Moving to target location...")
     node.publish_pose(target_pose)
-    time.sleep(2)
+    # FIXED: Wait for movement to complete
+    node.wait_for_execution_complete(timeout=10.0)
 
     # Release dollar bill
     node.get_logger().info("Releasing dollar bill...")
     node.publish_gripper_position(0.0)
-    time.sleep(1)
+    # FIXED: Wait for gripper to open
+    node.wait_for_execution_complete(timeout=5.0)
 
     # Return to initial position
     if node.init_arm_pose is not None:
@@ -604,6 +611,8 @@ def main(args=None):
             node.init_arm_pose.orientation.z, node.init_arm_pose.orientation.w
         ]
         node.publish_pose(init_pose)
+        # FIXED: Wait for return to complete
+        node.wait_for_execution_complete(timeout=10.0)
 
     node.get_logger().info("Dollar bill pickup completed successfully!")
     node.destroy_node()
