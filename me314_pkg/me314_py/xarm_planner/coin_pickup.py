@@ -18,9 +18,9 @@ from me314_msgs.msg import CommandQueue, CommandWrapper
 
 CAMERA_OFFSET = 0.058
 
-class CoinPickup(Node):
+class DollarBill(Node):
     def __init__(self):
-        super().__init__('coin_node')
+        super().__init__('dollarbill_node')
 
         self.bridge = CvBridge()
 
@@ -50,7 +50,7 @@ class CoinPickup(Node):
         self.FT_torque_z = 0.0
         self.ft_ext_state_sub = self.create_subscription(WrenchStamped, '/xarm/uf_ftsensor_ext_states', self.ft_ext_state_cb, 10)
 
-        # Execution state monitoring
+        #Execution state monitoring
         self.arm_executing_sub = self.create_subscription(Bool, '/me314_xarm_is_executing', self.execution_state_callback, 10)
         self.arm_executing = True
 
@@ -68,7 +68,7 @@ class CoinPickup(Node):
         self.gotDepth = False
 
         # Force thresholds
-        self.surface_force_threshold = 1.0  # Threshold for table contact detection
+        self.surface_force_threshold = 5.0  # Threshold for table contact detection
 
     def arm_pose_callback(self, msg: Pose):
         self.current_arm_pose = msg
@@ -142,23 +142,26 @@ class CoinPickup(Node):
     #  NEW CODE
     # ---------------------------------------------------------------------
 
+    def execution_state_callback(self, msg: Bool):
+        self.arm_executing = msg.data
+
     def depth_callback(self, msg: Image):
-        if self.coin_center is None or self.target_center is None:
+        if self.dollar_bill_center is None or self.target_center is None:
             return
         else:
-            self.get_logger().info("Both coin and target detected.")
+            # self.get_logger().info("Both dollar bill and target detected.")
             aligned_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            qx, qy = self.coin_center
-            self.coin_depth = aligned_depth[qy, qx]
+            dx, dy = self.dollar_bill_center
+            self.dollar_bill_depth = aligned_depth[dy, dx]
             gx, gy = self.target_center
             self.target_depth = aligned_depth[gy, gx]
 
     def realsense_callback(self, msg: Image):
         if msg is None:
-            self.get_logger().error("Received an empty image message!")
+            # self.get_logger().error("Received an empty image message!")
             return
         
-        self.get_logger().info('Received an image')
+        # self.get_logger().info('Received an image')
 
         # If there are no center coordinates for red OR green:
         # 1) raise camera
@@ -166,7 +169,7 @@ class CoinPickup(Node):
         # 3) if both are found, set their coordinates
         # 4) if both are not found, raise camera return empty
 
-        if self.coin_center is None or self.target_center is None:
+        if self.dollar_bill_center is None or self.target_center is None:
             if self.current_arm_pose is not None:
                 pose = self.current_arm_pose
                 if self.init_arm_pose is None:
@@ -184,95 +187,103 @@ class CoinPickup(Node):
                 ]
 
                 self.publish_pose(new_pose)
-                self.get_logger().info("Raising camera to look for objects...")
+                # self.get_logger().info("Raising camera to look for objects...")
 
                 cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
 
-                # Look for coin and target
-                masked_image_coin, coin_center = self.mask_gray_coin(cv_image)
+                # Look for dollar bill and target
+                masked_image_dollar, dollar_center, dollar_angle = self.mask_dollar_bill(cv_image)
                 masked_image_green, green_center = self.mask_green_object(cv_image)
                 
-                if coin_center != (None, None):
-                    self.get_logger().info(f"Found coin at: {coin_center}")
-                    self.coin_center = coin_center
+                if dollar_center != (None, None):
+                    # self.get_logger().info(f"Found dollar bill at: {dollar_center}, angle: {dollar_angle:.1f}°")
+                    self.dollar_bill_center = dollar_center
+                    self.dollar_bill_angle = dollar_angle
 
                 if green_center != (None, None):
-                    self.get_logger().info(f"Found target at: {green_center}")
+                    # self.get_logger().info(f"Found target at: {green_center}")
                     self.target_center = green_center
 
-    def mask_gray_coin(self, image: np.ndarray):
+
+    def mask_dollar_bill(self, image: np.ndarray):
         """
-        Detect gray quarter-sized coin using color detection and circularity filtering.
-        Returns the annotated image and center coordinates.
+        Detect dollar bill using darker green color detection and determine its orientation.
+        Returns the annotated image, center coordinates, and orientation angle.
         """
-        # Convert to different color spaces for better gray detection
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        # cv2.imwrite("test.jpg", bgr)
+        # cv2.imshow("bgr im", bgr)
 
-        # Method 1: HSV-based gray detection (low saturation, medium value)
-        lower_gray_hsv = np.array([0, 0, 60])    # Low saturation, medium-low brightness
-        upper_gray_hsv = np.array([180, 60, 200]) # Any hue, low saturation, medium-high brightness
-        mask_hsv = cv2.inRange(hsv, lower_gray_hsv, upper_gray_hsv)
+        # Darker green range for fake dollar bill
+        lower_green = np.array([0, 3, 36])   # Darker, less saturated green
+        upper_green = np.array([179, 36, 96])  # Allow for various lighting conditions
 
-        # Method 2: Grayscale intensity-based detection
-        lower_gray_intensity = 80   # Darker grays
-        upper_gray_intensity = 180  # Lighter grays
-        mask_gray = cv2.inRange(gray, lower_gray_intensity, upper_gray_intensity)
+        mask = cv2.inRange(hsv, lower_green, upper_green)
 
-        # Combine both methods
-        mask = cv2.bitwise_or(mask_hsv, mask_gray)
-
+        # cv2.imshow("mask for dollar bill", mask)
+        # cv2.waitKey(0)
         # Morphological operations to clean the mask
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.erode(mask, None, iterations=2)
+        mask = cv2.dilate(mask, None, iterations=2)
 
-        # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
-            return image, (None, None)
+            return image, (None, None), None
         
-        # Filter contours for quarter-like properties
-        coin_candidates = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
+        # Find the largest contour (should be the dollar bill)
+        largest = max(contours, key=cv2.contourArea)
+        
+        # Get minimum area rectangle to determine orientation
+        rect = cv2.minAreaRect(largest)
+        box = cv2.boxPoints(rect)
+        box = box.astype(int)
+        
+        # Calculate center
+        M = cv2.moments(largest)
+        if M["m00"] == 0:
+            return image, (None, None), None
+
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+
+        # Get the angle of the rectangle (orientation of dollar bill)
+        angle = rect[2]
+        
+        # OpenCV's minAreaRect returns angle between -90 and 0
+        # We want to map this to a -90 to 90 range properly
+        width, height = rect[1]
+        
+        if width < height:
+            # Rectangle is taller than wide, rotate by 90 degrees
+            angle += 90
+        
+        # FIXED: Constrain angle to -90 to 90 range
+        while angle > 90:
+            angle -= 180
+        while angle < -90:
+            angle += 180
             
-            # Filter by area (quarter is small but not tiny)
-            # Assuming quarter appears as 200-2000 pixels depending on distance
-            if 200 < area < 2000:
-                # Check circularity
-                perimeter = cv2.arcLength(contour, True)
-                if perimeter > 0:
-                    circularity = 4 * np.pi * area / (perimeter * perimeter)
-                    
-                    # Quarters are circular, so check for good circularity
-                    if circularity > 0.6:  # More lenient than perfect circle due to image noise
-                        # Get the center
-                        M = cv2.moments(contour)
-                        if M["m00"] > 0:
-                            cx = int(M["m10"] / M["m00"])
-                            cy = int(M["m01"] / M["m00"])
-                            coin_candidates.append((contour, area, circularity, (cx, cy)))
-
-        if not coin_candidates:
-            return image, (None, None)
-
-        # Select the best candidate (highest circularity, then largest area)
-        coin_candidates.sort(key=lambda x: (x[2], x[1]), reverse=True)
-        best_contour, _, best_circularity, center = coin_candidates[0]
+        # Additional constraint to prevent large rotations
+        # If angle is close to ±90, prefer the smaller rotation
+        if angle > 45:
+            angle -= 90
+        elif angle < -45:
+            angle += 90
 
         # Annotate image
         result = image.copy()
-        cv2.drawContours(result, [best_contour], -1, (255, 255, 0), 2)  # Cyan contour
-        cv2.circle(result, center, 5, (255, 0, 0), -1)  # Red center dot
+        cv2.drawContours(result, [box], 0, (0, 255, 255), 2)  # Yellow rectangle
+        cv2.circle(result, (cx, cy), 5, (255, 0, 0), -1)  # Red center dot
         
-        # Add text annotation
-        cv2.putText(result, f"Coin: {best_circularity:.2f}", 
-                   (center[0] + 10, center[1] - 10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Draw orientation line
+        length = 50
+        end_x = int(cx + length * np.cos(np.radians(angle)))
+        end_y = int(cy + length * np.sin(np.radians(angle)))
+        cv2.line(result, (cx, cy), (end_x, end_y), (255, 0, 255), 2)  # Magenta line
 
-        return result, center
+        return result, (cx, cy), angle
 
     def mask_green_object(self, image: np.ndarray):
         """
@@ -310,10 +321,9 @@ class CoinPickup(Node):
         cv2.circle(result, (cx, cy), 5, (0, 0, 255), -1)  # Green center dot
         return result, (cx, cy)
     
-    def find_surface_contact(self, xy_pose, start_height, step_size=0.001, max_steps=80):
+    def find_surface_contact(self, xy_pose, start_height, step_size=0.002, max_steps=50):
         """
         Gradually lower the gripper until contact with table surface is detected.
-        More precise for thin objects like coins.
         Returns (success, contact_z_height)
         """
         self.get_logger().info("FINDING TABLE SURFACE HEIGHT USING FORCE FEEDBACK...")
@@ -330,55 +340,81 @@ class CoinPickup(Node):
             self.publish_pose(test_pose)
             
             # Wait for movement and force reading
-            time.sleep(0.2)  # Shorter delay for more responsive detection
-            
+            cur_time = time.time()
+
+            while time.time() - cur_time < 0.5:
+                rclpy.spin_once(self)
+
+            print(self.FT_force_z)
             # Check for contact with table (force above threshold)
             if abs(self.FT_force_z) > self.surface_force_threshold:
                 self.get_logger().info(f"TABLE CONTACT DETECTED AT Z={current_z:.4f}, FORCE_Z={self.FT_force_z:.2f}N")
                 return True, current_z
             
+            if step == 0:
+                self.wait_for_execution_complete(timeout=2.0)
+
             current_z -= step_size
         
         self.get_logger().warn(f"NO TABLE CONTACT DETECTED AFTER {max_steps} STEPS")
         return False, None
     
-    def rapid_grasp_and_lift(self, grasp_pose, lift_height=0.08):
-        """
-        Rapidly close gripper and lift to avoid crushing sensors on table.
-        Optimized for thin objects like coins.
-        Uses incremental lifting (1mm steps) coordinated with gripper closing.
-        """
-        self.get_logger().info("EXECUTING COORDINATED GRASP AND LIFT FOR COIN...")
+    def wait_for_execution_complete(self, timeout=10.0):
+        """Wait for the robot to finish executing current commands"""
+        start_time = time.time()
         
-        # Parameters for coordinated motion - more precise for coins
-        height_increment = 0.001  # 1mm per step (finer than dollar bill)
-        gripper_increment = 0.01  # Gripper closing increment
-        target_gripper_pos = 0.9  # Close more firmly for small objects
+        # Wait a bit for execution to start
+        time.sleep(0.1)
         
+        while (time.time() - start_time) < timeout:
+            rclpy.spin_once(self)
+            time.sleep(0.01)  # Small sleep to prevent busy waiting
+        
+        # if self.arm_executing:
+        #     self.get_logger().warn(f"Execution timeout after {timeout}s")
+        # else:
+        #     self.get_logger().info("Execution completed")
+    
+    def rapid_grasp_and_lift(self, grasp_pose, lift_height=0.003, gripper_start=0.4):
+        """
+        Rapidly close gripper and lift - LIMITED TO 6 CYCLES
+        """
+        self.get_logger().info("EXECUTING COORDINATED GRASP AND LIFT...")
+        
+        # # FIXED: Cap at 6 cycles as requested
+        # num_steps = 6
+        # target_gripper_pos = 0.9294  # Final gripper position
+
+        
+
+        height_increment = 0.0002  # 2mm per step
+        gripper_increment = 0.02  # Gripper closing increment
+        target_gripper_pos = 0.9294  # Final gripper position
+
         # Calculate number of steps
-        height_steps = int(lift_height / height_increment)  # e.g., 80mm / 1mm = 80 steps
-        gripper_steps = int(target_gripper_pos / gripper_increment)  # e.g., 0.9 / 0.01 = 90 steps
-        
+        height_steps = int(lift_height / height_increment)  # e.g., 100mm / 2mm = 50 steps
+        gripper_steps = int((target_gripper_pos - gripper_start) / gripper_increment)  # e.g., 0.8 / 0.01 = 80 steps
+
         # Use the larger number of steps for smoother motion
         num_steps = max(height_steps, gripper_steps)
         
-        # Recalculate increments to distribute evenly over num_steps
+        # Calculate evenly spaced increments for 6 steps
         actual_height_increment = lift_height / num_steps
-        actual_gripper_increment = target_gripper_pos / num_steps
+        actual_gripper_increment = (target_gripper_pos - gripper_start) / num_steps
         
         self.get_logger().info(f"Coordinated motion: {num_steps} steps, "
-                               f"height increment: {actual_height_increment*1000:.1f}mm, "
-                               f"gripper increment: {actual_gripper_increment:.3f}")
+                            f"height increment: {actual_height_increment*1000:.1f}mm, "
+                            f"gripper increment: {actual_gripper_increment:.3f}")
         
         # Starting positions
-        current_gripper_pos = 0.0
+        current_gripper_pos = gripper_start
         start_z = grasp_pose[2]
         
         # Execute coordinated motion loop
         for step in range(num_steps):
             # Calculate new positions
             current_height = start_z + (step + 1) * actual_height_increment
-            current_gripper_pos = (step + 1) * actual_gripper_increment
+            current_gripper_pos = gripper_start + (step + 1) * actual_gripper_increment
             
             # Ensure we don't exceed target values
             current_gripper_pos = min(current_gripper_pos, target_gripper_pos)
@@ -398,19 +434,109 @@ class CoinPickup(Node):
             self.publish_pose(current_pose)
             self.publish_gripper_position(current_gripper_pos)
             
-            # Log progress every 15 steps
-            if step % 15 == 0 or step == num_steps - 1:
+            # Log progress every 10 steps
+            if step % 10 == 0 or step == num_steps - 1:
                 self.get_logger().info(f"Step {step+1}/{num_steps}: "
                                        f"height={current_height:.4f}m, "
                                        f"gripper={current_gripper_pos:.2f}")
             
             # Small delay between steps for smooth motion
-            time.sleep(0.03)  # 30ms delay per step (faster for coins)
+            time.sleep(0.05)  # 50ms delay per step
         
         # Final hold to ensure motion completes
         time.sleep(0.5)
         
-        self.get_logger().info("COORDINATED COIN GRASP AND LIFT COMPLETED")
+        self.get_logger().info("COORDINATED GRASP AND LIFT COMPLETED")
+
+
+        # # Parameters for coordinated motion
+        # height_increment = 0.002  # 2mm per step
+        # gripper_increment = 0.01  # Gripper closing increment
+        # target_gripper_pos = 0.974  # Final gripper position
+        
+        # # Calculate number of steps
+        # height_steps = int(lift_height / height_increment)  # e.g., 100mm / 2mm = 50 steps
+        # gripper_steps = int(target_gripper_pos / gripper_increment)  # e.g., 0.8 / 0.01 = 80 steps
+        
+        # # Use the larger number of steps for smoother motion
+        # num_steps = max(height_steps, gripper_steps)
+        
+        # # Recalculate increments to distribute evenly over num_steps
+        # actual_height_increment = lift_height / num_steps
+        # actual_gripper_increment = target_gripper_pos / num_steps
+        
+        # self.get_logger().info(f"Coordinated motion: {num_steps} steps, "
+        #                        f"height increment: {actual_height_increment*1000:.1f}mm, "
+        #                        f"gripper increment: {actual_gripper_increment:.3f}")
+        
+        # # Starting positions
+        # current_gripper_pos = 0.0
+        # start_z = grasp_pose[2]
+        
+        # # Execute coordinated motion loop
+        # for step in range(num_steps):
+        #     # Calculate new positions
+        #     current_height = start_z + (step + 1) * actual_height_increment
+        #     current_gripper_pos = (step + 1) * actual_gripper_increment
+            
+        #     # Ensure we don't exceed target values
+        #     current_gripper_pos = min(current_gripper_pos, target_gripper_pos)
+            
+        #     # Create pose for current step
+        #     current_pose = [
+        #         grasp_pose[0],
+        #         grasp_pose[1], 
+        #         current_height,
+        #         grasp_pose[3],
+        #         grasp_pose[4],
+        #         grasp_pose[5],
+        #         grasp_pose[6]
+        #     ]
+            
+        #     # Execute coordinated commands
+        #     self.publish_pose(current_pose)
+        #     self.publish_gripper_position(current_gripper_pos)
+            
+        #     # Log progress every 10 steps
+        #     if step % 10 == 0 or step == num_steps - 1:
+        #         self.get_logger().info(f"Step {step+1}/{num_steps}: "
+        #                                f"height={current_height:.4f}m, "
+        #                                f"gripper={current_gripper_pos:.2f}")
+            
+        #     # Small delay between steps for smooth motion
+        #     time.sleep(0.05)  # 50ms delay per step
+        
+        # # Final hold to ensure motion completes
+        # time.sleep(0.5)
+        
+        # self.get_logger().info("COORDINATED GRASP AND LIFT COMPLETED")
+
+    def create_oriented_pose(self, world_coords, angle_degrees):
+        """
+        Create a pose that aligns the gripper with the long side of the dollar bill.
+        """
+        # FIXED: If rotation direction is wrong, try negating the angle
+        angle_rad = np.radians(-angle_degrees)  # Note the negative sign
+        
+        # Create rotation around Z-axis to align with dollar bill orientation
+        rotation = R.from_euler('z', angle_rad)
+        
+        # Base orientation (pointing down)
+        base_quat = R.from_euler('xyz', [np.pi, 0, 0])  # Point gripper down
+        
+        # Combine rotations
+        final_rotation = rotation * base_quat
+        final_quat = final_rotation.as_quat()  # [x, y, z, w]
+        
+        return [
+            world_coords[0, 0],
+            world_coords[1, 0], 
+            world_coords[2, 0],
+            final_quat[0],  # qx
+            final_quat[1],  # qy  
+            final_quat[2],  # qz
+            final_quat[3]   # qw
+        ]
 
     # Coordinate transformation from image to camera in world frame
     def img_pixel_to_cam(self, pixel_coords, depth_m):
@@ -473,55 +599,61 @@ class CoinPickup(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = CoinPickup()
+    node = DollarBill()
 
     # Wait until both objects are found and depth is available
     while not node.found or not node.gotDepth:
         rclpy.spin_once(node)
-        if node.coin_center is not None and node.target_center is not None:
+        if node.dollar_bill_center is not None and node.target_center is not None:
             node.found = True
-        if node.coin_depth is not None and node.target_depth is not None:
+        if node.dollar_bill_depth is not None and node.target_depth is not None:
             node.gotDepth = True
 
     node.get_logger().info("Opening gripper...")
     node.publish_gripper_position(0.0)
+    # FIXED: Wait for gripper to actually open
+    node.wait_for_execution_complete(timeout=5.0)
+
+    node.publish_gripper_position(0.6)
 
     # Convert pixel coordinates to world coordinates
-    camera_coords_coin = node.img_pixel_to_cam(node.coin_center, node.coin_depth/1000.0)
+    camera_coords_dollar = node.img_pixel_to_cam(node.dollar_bill_center, node.dollar_bill_depth/1000.0)
     camera_coords_target = node.img_pixel_to_cam(node.target_center, node.target_depth/1000.0)
     
-    world_coords_coin = node.camera_to_base_tf(camera_coords_coin, 'camera_color_optical_frame')
+    node.get_logger().info(f"Dollar bill camera coords: {camera_coords_dollar}")
+    node.get_logger().info(f"Target camera coords: {camera_coords_target}")
+
+    world_coords_dollar = node.camera_to_base_tf(camera_coords_dollar, 'camera_color_optical_frame')
     world_coords_target = node.camera_to_base_tf(camera_coords_target, 'camera_color_optical_frame')
     
-    node.get_logger().info(f"Coin world coords: {world_coords_coin}")
+    node.get_logger().info(f"Dollar bill world coords: {world_coords_dollar}")
     node.get_logger().info(f"Target world coords: {world_coords_target}")
+    node.get_logger().info(f"Dollar bill orientation: {node.dollar_bill_angle:.1f}°")
 
-    # Create pose above coin
-    pose_above_coin = [
-        world_coords_coin[0, 0],
-        world_coords_coin[1, 0], 
-        world_coords_coin[2, 0] + 0.15,  # 15cm above for approach
-        1.0, 0.0, 0.0, 0.0  # Simple downward orientation
-    ]
-
-    # Move above coin
-    node.get_logger().info("Moving above coin...")
-    node.publish_pose(pose_above_coin)
-    time.sleep(2)
+    # Create oriented pose aligned with dollar bill's long side
+    oriented_pose_above = node.create_oriented_pose(world_coords_dollar, node.dollar_bill_angle)
+    oriented_pose_above[2] += 0.20  # 15cm above for approach
+        
+    # Move above dollar bill with correct orientation
+    node.get_logger().info("Moving above dollar bill with correct orientation...")
+    node.publish_pose(oriented_pose_above)
+    # FIXED: Replace arbitrary 20 second sleep with proper execution waiting
+    node.wait_for_execution_complete(timeout=20.0)
 
     # Find table surface using force feedback
     node.get_logger().info("Detecting table surface...")
     surface_found, surface_z = node.find_surface_contact(
-        pose_above_coin, 
-        world_coords_coin[2, 0] + 0.08,  # Start 8cm above estimated position
-        step_size=0.001,  # 1mm steps for precision with coins
-        max_steps=80
+        oriented_pose_above, 
+        world_coords_dollar[2, 0] + 0.1,  # Start 10cm above estimated position
+        step_size=0.001,  # 1mm steps for precision
+        max_steps=50
     )
 
     if not surface_found:
         node.get_logger().error("Failed to detect table surface - aborting operation.")
-        node.publish_gripper_position(0.0)
-        time.sleep(1)
+        node.publish_gripper_position(0.6)
+        node.wait_for_execution_complete(timeout=3.0)  # FIXED: Wait for gripper to open
+        
         if node.init_arm_pose is not None:
             init_pose = [
                 node.init_arm_pose.position.x, node.init_arm_pose.position.y, node.init_arm_pose.position.z,
@@ -529,37 +661,38 @@ def main(args=None):
                 node.init_arm_pose.orientation.z, node.init_arm_pose.orientation.w
             ]
             node.publish_pose(init_pose)
+            node.wait_for_execution_complete(timeout=10.0)  # FIXED: Wait for return to initial position
+        
         node.destroy_node()
         rclpy.shutdown()
         return
 
     # Create grasp pose at detected surface height
-    grasp_pose = [
-        world_coords_coin[0, 0],
-        world_coords_coin[1, 0], 
-        surface_z + 0.001,  # Just 1mm above surface (coins are very thin)
-        1.0, 0.0, 0.0, 0.0
-    ]
+    grasp_pose = node.create_oriented_pose(world_coords_dollar, node.dollar_bill_angle)
+    grasp_pose[2] = surface_z + 0.012  # Just 2mm above surface to touch dollar bill
 
     node.get_logger().info(f"Moving to grasp position at surface height: {surface_z:.4f}")
     node.publish_pose(grasp_pose)
-    time.sleep(1)
+    # FIXED: Wait for movement to complete
+    node.wait_for_execution_complete(timeout=10.0)
 
-    # Execute coordinated grasp and lift optimized for coins
-    node.rapid_grasp_and_lift(grasp_pose, lift_height=0.08)
+    # Execute rapid grasp and lift (already has proper waiting built-in)
+    node.rapid_grasp_and_lift(grasp_pose)
 
     # Move to target location
-    target_pose = [world_coords_target[0, 0], world_coords_target[1, 0], world_coords_target[2, 0] + 0.1,
+    target_pose = [world_coords_target[0, 0], world_coords_target[1, 0], world_coords_target[2, 0] + 0.2,
                    1.0, 0.0, 0.0, 0.0]
     
     node.get_logger().info("Moving to target location...")
     node.publish_pose(target_pose)
-    time.sleep(2)
+    # FIXED: Wait for movement to complete
+    node.wait_for_execution_complete(timeout=10.0)
 
-    # Release coin
-    node.get_logger().info("Releasing coin...")
+    # Release dollar bill
+    node.get_logger().info("Releasing dollar bill...")
     node.publish_gripper_position(0.0)
-    time.sleep(1)
+    # FIXED: Wait for gripper to open
+    node.wait_for_execution_complete(timeout=5.0)
 
     # Return to initial position
     if node.init_arm_pose is not None:
@@ -570,8 +703,10 @@ def main(args=None):
             node.init_arm_pose.orientation.z, node.init_arm_pose.orientation.w
         ]
         node.publish_pose(init_pose)
+        # FIXED: Wait for return to complete
+        node.wait_for_execution_complete(timeout=10.0)
 
-    node.get_logger().info("Coin pickup completed successfully!")
+    node.get_logger().info("Dollar bill pickup completed successfully!")
     node.destroy_node()
     rclpy.shutdown()
 
