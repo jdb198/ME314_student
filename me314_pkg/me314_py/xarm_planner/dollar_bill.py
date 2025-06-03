@@ -68,7 +68,7 @@ class DollarBill(Node):
         self.gotDepth = False
 
         # Force thresholds
-        self.surface_force_threshold = 1.0  # Threshold for table contact detection
+        self.surface_force_threshold = 5.0  # Threshold for table contact detection
 
     def arm_pose_callback(self, msg: Pose):
         self.current_arm_pose = msg
@@ -149,7 +149,7 @@ class DollarBill(Node):
         if self.dollar_bill_center is None or self.target_center is None:
             return
         else:
-            self.get_logger().info("Both dollar bill and target detected.")
+            # self.get_logger().info("Both dollar bill and target detected.")
             aligned_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
             dx, dy = self.dollar_bill_center
             self.dollar_bill_depth = aligned_depth[dy, dx]
@@ -158,10 +158,10 @@ class DollarBill(Node):
 
     def realsense_callback(self, msg: Image):
         if msg is None:
-            self.get_logger().error("Received an empty image message!")
+            # self.get_logger().error("Received an empty image message!")
             return
         
-        self.get_logger().info('Received an image')
+        # self.get_logger().info('Received an image')
 
         # If there are no center coordinates for red OR green:
         # 1) raise camera
@@ -187,7 +187,7 @@ class DollarBill(Node):
                 ]
 
                 self.publish_pose(new_pose)
-                self.get_logger().info("Raising camera to look for objects...")
+                # self.get_logger().info("Raising camera to look for objects...")
 
                 cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
 
@@ -196,12 +196,12 @@ class DollarBill(Node):
                 masked_image_green, green_center = self.mask_green_object(cv_image)
                 
                 if dollar_center != (None, None):
-                    self.get_logger().info(f"Found dollar bill at: {dollar_center}, angle: {dollar_angle:.1f}°")
+                    # self.get_logger().info(f"Found dollar bill at: {dollar_center}, angle: {dollar_angle:.1f}°")
                     self.dollar_bill_center = dollar_center
                     self.dollar_bill_angle = dollar_angle
 
                 if green_center != (None, None):
-                    self.get_logger().info(f"Found target at: {green_center}")
+                    # self.get_logger().info(f"Found target at: {green_center}")
                     self.target_center = green_center
 
 
@@ -212,8 +212,8 @@ class DollarBill(Node):
         """
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
         bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        #cv2.imwrite("test.jpg", bgr)
-        #cv2.imshow("bgr im", bgr)
+        # cv2.imwrite("test.jpg", bgr)
+        # cv2.imshow("bgr im", bgr)
 
         # Darker green range for fake dollar bill
         lower_green = np.array([9, 33, 20])   # Darker, less saturated green
@@ -221,8 +221,8 @@ class DollarBill(Node):
 
         mask = cv2.inRange(hsv, lower_green, upper_green)
 
-        #cv2.imshow("mask for dollar bill", mask)
-        #cv2.waitKey(0)
+        # cv2.imshow("mask for dollar bill", mask)
+        # cv2.waitKey(0)
         # Morphological operations to clean the mask
         mask = cv2.erode(mask, None, iterations=2)
         mask = cv2.dilate(mask, None, iterations=2)
@@ -342,7 +342,7 @@ class DollarBill(Node):
             # Wait for movement and force reading
             cur_time = time.time()
 
-            while time.time() - cur_time < 0.3:
+            while time.time() - cur_time < 0.5:
                 rclpy.spin_once(self)
 
             print(self.FT_force_z)
@@ -351,6 +351,9 @@ class DollarBill(Node):
                 self.get_logger().info(f"TABLE CONTACT DETECTED AT Z={current_z:.4f}, FORCE_Z={self.FT_force_z:.2f}N")
                 return True, current_z
             
+            if step == 0:
+                self.wait_for_execution_complete(timeout=2.0)
+
             current_z -= step_size
         
         self.get_logger().warn(f"NO TABLE CONTACT DETECTED AFTER {max_steps} STEPS")
@@ -363,24 +366,35 @@ class DollarBill(Node):
         # Wait a bit for execution to start
         time.sleep(0.1)
         
-        while self.arm_executing and (time.time() - start_time) < timeout:
+        while (time.time() - start_time) < timeout:
             rclpy.spin_once(self)
             time.sleep(0.01)  # Small sleep to prevent busy waiting
         
-        if self.arm_executing:
-            self.get_logger().warn(f"Execution timeout after {timeout}s")
-        else:
-            self.get_logger().info("Execution completed")
+        # if self.arm_executing:
+        #     self.get_logger().warn(f"Execution timeout after {timeout}s")
+        # else:
+        #     self.get_logger().info("Execution completed")
     
-    def rapid_grasp_and_lift(self, grasp_pose, lift_height=0.0127):
+    def rapid_grasp_and_lift(self, grasp_pose, lift_height= 0.018):
         """
         Rapidly close gripper and lift - LIMITED TO 6 CYCLES
         """
         self.get_logger().info("EXECUTING COORDINATED GRASP AND LIFT...")
         
-        # FIXED: Cap at 6 cycles as requested
-        num_steps = 6
-        target_gripper_pos = 0.974  # Final gripper position
+        # # FIXED: Cap at 6 cycles as requested
+        # num_steps = 6
+        # target_gripper_pos = 0.9294  # Final gripper position
+
+        height_increment = 0.006  # 2mm per step
+        gripper_increment = 0.02  # Gripper closing increment
+        target_gripper_pos = 0.9294  # Final gripper position
+
+        # Calculate number of steps
+        height_steps = int(lift_height / height_increment)  # e.g., 100mm / 2mm = 50 steps
+        gripper_steps = int(target_gripper_pos / gripper_increment)  # e.g., 0.8 / 0.01 = 80 steps
+
+        # Use the larger number of steps for smoother motion
+        num_steps = max(height_steps, gripper_steps)
         
         # Calculate evenly spaced increments for 6 steps
         actual_height_increment = lift_height / num_steps
@@ -391,6 +405,7 @@ class DollarBill(Node):
                             f"gripper increment: {actual_gripper_increment:.3f}")
         
         # Starting positions
+        current_gripper_pos = 0.0
         start_z = grasp_pose[2]
         
         # Execute coordinated motion loop
@@ -404,22 +419,95 @@ class DollarBill(Node):
             
             # Create pose for current step
             current_pose = [
-                grasp_pose[0], grasp_pose[1], current_height,
-                grasp_pose[3], grasp_pose[4], grasp_pose[5], grasp_pose[6]
+                grasp_pose[0],
+                grasp_pose[1], 
+                current_height,
+                grasp_pose[3],
+                grasp_pose[4],
+                grasp_pose[5],
+                grasp_pose[6]
             ]
             
-            # Execute commands and WAIT for completion
+            # Execute coordinated commands
             self.publish_pose(current_pose)
             self.publish_gripper_position(current_gripper_pos)
             
-            self.get_logger().info(f"Step {step+1}/{num_steps}: "
-                                f"height={current_height:.4f}m, "
-                                f"gripper={current_gripper_pos:.2f}")
+            # Log progress every 10 steps
+            if step % 10 == 0 or step == num_steps - 1:
+                self.get_logger().info(f"Step {step+1}/{num_steps}: "
+                                       f"height={current_height:.4f}m, "
+                                       f"gripper={current_gripper_pos:.2f}")
             
-            # FIXED: Actually wait for execution to complete
-            self.wait_for_execution_complete(timeout=5.0)
+            # Small delay between steps for smooth motion
+            time.sleep(0.05)  # 50ms delay per step
+        
+        # Final hold to ensure motion completes
+        time.sleep(0.5)
         
         self.get_logger().info("COORDINATED GRASP AND LIFT COMPLETED")
+
+
+        # # Parameters for coordinated motion
+        # height_increment = 0.002  # 2mm per step
+        # gripper_increment = 0.01  # Gripper closing increment
+        # target_gripper_pos = 0.974  # Final gripper position
+        
+        # # Calculate number of steps
+        # height_steps = int(lift_height / height_increment)  # e.g., 100mm / 2mm = 50 steps
+        # gripper_steps = int(target_gripper_pos / gripper_increment)  # e.g., 0.8 / 0.01 = 80 steps
+        
+        # # Use the larger number of steps for smoother motion
+        # num_steps = max(height_steps, gripper_steps)
+        
+        # # Recalculate increments to distribute evenly over num_steps
+        # actual_height_increment = lift_height / num_steps
+        # actual_gripper_increment = target_gripper_pos / num_steps
+        
+        # self.get_logger().info(f"Coordinated motion: {num_steps} steps, "
+        #                        f"height increment: {actual_height_increment*1000:.1f}mm, "
+        #                        f"gripper increment: {actual_gripper_increment:.3f}")
+        
+        # # Starting positions
+        # current_gripper_pos = 0.0
+        # start_z = grasp_pose[2]
+        
+        # # Execute coordinated motion loop
+        # for step in range(num_steps):
+        #     # Calculate new positions
+        #     current_height = start_z + (step + 1) * actual_height_increment
+        #     current_gripper_pos = (step + 1) * actual_gripper_increment
+            
+        #     # Ensure we don't exceed target values
+        #     current_gripper_pos = min(current_gripper_pos, target_gripper_pos)
+            
+        #     # Create pose for current step
+        #     current_pose = [
+        #         grasp_pose[0],
+        #         grasp_pose[1], 
+        #         current_height,
+        #         grasp_pose[3],
+        #         grasp_pose[4],
+        #         grasp_pose[5],
+        #         grasp_pose[6]
+        #     ]
+            
+        #     # Execute coordinated commands
+        #     self.publish_pose(current_pose)
+        #     self.publish_gripper_position(current_gripper_pos)
+            
+        #     # Log progress every 10 steps
+        #     if step % 10 == 0 or step == num_steps - 1:
+        #         self.get_logger().info(f"Step {step+1}/{num_steps}: "
+        #                                f"height={current_height:.4f}m, "
+        #                                f"gripper={current_gripper_pos:.2f}")
+            
+        #     # Small delay between steps for smooth motion
+        #     time.sleep(0.05)  # 50ms delay per step
+        
+        # # Final hold to ensure motion completes
+        # time.sleep(0.5)
+        
+        # self.get_logger().info("COORDINATED GRASP AND LIFT COMPLETED")
 
     def create_oriented_pose(self, world_coords, angle_degrees):
         """
@@ -546,7 +634,7 @@ def main(args=None):
     node.get_logger().info("Moving above dollar bill with correct orientation...")
     node.publish_pose(oriented_pose_above)
     # FIXED: Replace arbitrary 20 second sleep with proper execution waiting
-    node.wait_for_execution_complete(timeout=15.0)
+    node.wait_for_execution_complete(timeout=20.0)
 
     # Find table surface using force feedback
     node.get_logger().info("Detecting table surface...")
@@ -585,10 +673,10 @@ def main(args=None):
     node.wait_for_execution_complete(timeout=10.0)
 
     # Execute rapid grasp and lift (already has proper waiting built-in)
-    node.rapid_grasp_and_lift(grasp_pose, lift_height=0.1)
+    node.rapid_grasp_and_lift(grasp_pose)
 
     # Move to target location
-    target_pose = [world_coords_target[0, 0], world_coords_target[1, 0], world_coords_target[2, 0] + 0.1,
+    target_pose = [world_coords_target[0, 0], world_coords_target[1, 0], world_coords_target[2, 0] + 0.2,
                    1.0, 0.0, 0.0, 0.0]
     
     node.get_logger().info("Moving to target location...")
