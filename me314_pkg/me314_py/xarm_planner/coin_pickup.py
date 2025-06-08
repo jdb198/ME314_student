@@ -18,9 +18,9 @@ from me314_msgs.msg import CommandQueue, CommandWrapper
 
 CAMERA_OFFSET = 0.058
 
-class DollarBill(Node):
+class CoinPickup(Node):
     def __init__(self):
-        super().__init__('dollarbill_node')
+        super().__init__('coin_node')
 
         self.bridge = CvBridge()
 
@@ -54,9 +54,9 @@ class DollarBill(Node):
         self.arm_executing_sub = self.create_subscription(Bool, '/me314_xarm_is_executing', self.execution_state_callback, 10)
         self.arm_executing = True
 
-        self.dollar_bill_center = None
-        self.dollar_bill_depth = None
-        self.dollar_bill_angle = None  # Orientation angle
+        self.coin_center = None
+        self.coin_depth = None
+        self.coin_angle = None  # Orientation angle
         self.target_center = None
         self.target_depth = None
 
@@ -146,13 +146,13 @@ class DollarBill(Node):
         self.arm_executing = msg.data
 
     def depth_callback(self, msg: Image):
-        if self.dollar_bill_center is None or self.target_center is None:
+        if self.coin_center is None or self.target_center is None:
             return
         else:
-            # self.get_logger().info("Both dollar bill and target detected.")
+            # self.get_logger().info("Both coin and target detected.")
             aligned_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            dx, dy = self.dollar_bill_center
-            self.dollar_bill_depth = aligned_depth[dy, dx]
+            dx, dy = self.coin_center
+            self.coin_depth = aligned_depth[dy, dx]
             gx, gy = self.target_center
             self.target_depth = aligned_depth[gy, gx]
 
@@ -169,7 +169,7 @@ class DollarBill(Node):
         # 3) if both are found, set their coordinates
         # 4) if both are not found, raise camera return empty
 
-        if self.dollar_bill_center is None or self.target_center is None:
+        if self.coin_center is None or self.target_center is None:
             if self.current_arm_pose is not None:
                 pose = self.current_arm_pose
                 if self.init_arm_pose is None:
@@ -191,23 +191,23 @@ class DollarBill(Node):
 
                 cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
 
-                # Look for dollar bill and target
-                masked_image_dollar, dollar_center, dollar_angle = self.mask_dollar_bill(cv_image)
+                # Look for coin and target
+                masked_image_coin, coin_center, coin_angle = self.mask_coin(cv_image)
                 masked_image_green, green_center = self.mask_green_object(cv_image)
                 
-                if dollar_center != (None, None):
-                    # self.get_logger().info(f"Found dollar bill at: {dollar_center}, angle: {dollar_angle:.1f}°")
-                    self.dollar_bill_center = dollar_center
-                    self.dollar_bill_angle = dollar_angle
+                if coin_center != (None, None):
+                    # self.get_logger().info(f"Found coin at: {coin_center}, angle: {coin_angle:.1f}°")
+                    self.coin_center = coin_center
+                    self.coin_angle = coin_angle
 
                 if green_center != (None, None):
                     # self.get_logger().info(f"Found target at: {green_center}")
                     self.target_center = green_center
 
 
-    def mask_dollar_bill(self, image: np.ndarray):
+    def mask_coin(self, image: np.ndarray):
         """
-        Detect dollar bill using darker green color detection and determine its orientation.
+        Detect coin using darker green color detection and determine its orientation.
         Returns the annotated image, center coordinates, and orientation angle.
         """
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
@@ -215,13 +215,13 @@ class DollarBill(Node):
         # cv2.imwrite("test.jpg", bgr)
         # cv2.imshow("bgr im", bgr)
 
-        # Darker green range for fake dollar bill
+        # Darker green range for fake coin
         lower_green = np.array([0, 3, 36])   # Darker, less saturated green
         upper_green = np.array([179, 36, 96])  # Allow for various lighting conditions
 
         mask = cv2.inRange(hsv, lower_green, upper_green)
 
-        # cv2.imshow("mask for dollar bill", mask)
+        # cv2.imshow("mask for coin", mask)
         # cv2.waitKey(0)
         # Morphological operations to clean the mask
         mask = cv2.erode(mask, None, iterations=2)
@@ -232,7 +232,7 @@ class DollarBill(Node):
         if not contours:
             return image, (None, None), None
         
-        # Find the largest contour (should be the dollar bill)
+        # Find the largest contour (should be the coin)
         largest = max(contours, key=cv2.contourArea)
         
         # Get minimum area rectangle to determine orientation
@@ -248,7 +248,7 @@ class DollarBill(Node):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
-        # Get the angle of the rectangle (orientation of dollar bill)
+        # Get the angle of the rectangle (orientation of coin)
         angle = rect[2]
         
         # OpenCV's minAreaRect returns angle between -90 and 0
@@ -513,12 +513,12 @@ class DollarBill(Node):
 
     def create_oriented_pose(self, world_coords, angle_degrees):
         """
-        Create a pose that aligns the gripper with the long side of the dollar bill.
+        Create a pose that aligns the gripper with the long side of the coin.
         """
         # FIXED: If rotation direction is wrong, try negating the angle
         angle_rad = np.radians(-angle_degrees)  # Note the negative sign
         
-        # Create rotation around Z-axis to align with dollar bill orientation
+        # Create rotation around Z-axis to align with coin orientation
         rotation = R.from_euler('z', angle_rad)
         
         # Base orientation (pointing down)
@@ -599,14 +599,14 @@ class DollarBill(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = DollarBill()
+    node = CoinPickup()
 
     # Wait until both objects are found and depth is available
     while not node.found or not node.gotDepth:
         rclpy.spin_once(node)
-        if node.dollar_bill_center is not None and node.target_center is not None:
+        if node.coin_center is not None and node.target_center is not None:
             node.found = True
-        if node.dollar_bill_depth is not None and node.target_depth is not None:
+        if node.coin_depth is not None and node.target_depth is not None:
             node.gotDepth = True
 
     node.get_logger().info("Opening gripper...")
@@ -617,25 +617,25 @@ def main(args=None):
     node.publish_gripper_position(0.6)
 
     # Convert pixel coordinates to world coordinates
-    camera_coords_dollar = node.img_pixel_to_cam(node.dollar_bill_center, node.dollar_bill_depth/1000.0)
+    camera_coords_coin = node.img_pixel_to_cam(node.coin_center, node.coin_depth/1000.0)
     camera_coords_target = node.img_pixel_to_cam(node.target_center, node.target_depth/1000.0)
     
-    node.get_logger().info(f"Dollar bill camera coords: {camera_coords_dollar}")
+    node.get_logger().info(f"Coin camera coords: {camera_coords_coin}")
     node.get_logger().info(f"Target camera coords: {camera_coords_target}")
 
-    world_coords_dollar = node.camera_to_base_tf(camera_coords_dollar, 'camera_color_optical_frame')
+    world_coords_coin = node.camera_to_base_tf(camera_coords_coin, 'camera_color_optical_frame')
     world_coords_target = node.camera_to_base_tf(camera_coords_target, 'camera_color_optical_frame')
     
-    node.get_logger().info(f"Dollar bill world coords: {world_coords_dollar}")
+    node.get_logger().info(f"Coin world coords: {world_coords_coin}")
     node.get_logger().info(f"Target world coords: {world_coords_target}")
-    node.get_logger().info(f"Dollar bill orientation: {node.dollar_bill_angle:.1f}°")
+    node.get_logger().info(f"Coin orientation: {node.coin_angle:.1f}°")
 
-    # Create oriented pose aligned with dollar bill's long side
-    oriented_pose_above = node.create_oriented_pose(world_coords_dollar, node.dollar_bill_angle)
+    # Create oriented pose aligned with coin's long side
+    oriented_pose_above = node.create_oriented_pose(world_coords_coin, node.coin_angle)
     oriented_pose_above[2] += 0.20  # 15cm above for approach
         
-    # Move above dollar bill with correct orientation
-    node.get_logger().info("Moving above dollar bill with correct orientation...")
+    # Move above coin with correct orientation
+    node.get_logger().info("Moving above coin with correct orientation...")
     node.publish_pose(oriented_pose_above)
     # FIXED: Replace arbitrary 20 second sleep with proper execution waiting
     node.wait_for_execution_complete(timeout=20.0)
@@ -644,7 +644,7 @@ def main(args=None):
     node.get_logger().info("Detecting table surface...")
     surface_found, surface_z = node.find_surface_contact(
         oriented_pose_above, 
-        world_coords_dollar[2, 0] + 0.1,  # Start 10cm above estimated position
+        world_coords_coin[2, 0] + 0.1,  # Start 10cm above estimated position
         step_size=0.001,  # 1mm steps for precision
         max_steps=50
     )
@@ -668,8 +668,8 @@ def main(args=None):
         return
 
     # Create grasp pose at detected surface height
-    grasp_pose = node.create_oriented_pose(world_coords_dollar, node.dollar_bill_angle)
-    grasp_pose[2] = surface_z + 0.012  # Just 2mm above surface to touch dollar bill
+    grasp_pose = node.create_oriented_pose(world_coords_coin, node.coin_angle)
+    grasp_pose[2] = surface_z + 0.012  # Just 2mm above surface to touch coin
 
     node.get_logger().info(f"Moving to grasp position at surface height: {surface_z:.4f}")
     node.publish_pose(grasp_pose)
@@ -688,8 +688,8 @@ def main(args=None):
     # FIXED: Wait for movement to complete
     node.wait_for_execution_complete(timeout=10.0)
 
-    # Release dollar bill
-    node.get_logger().info("Releasing dollar bill...")
+    # Release coin
+    node.get_logger().info("Releasing coin...")
     node.publish_gripper_position(0.0)
     # FIXED: Wait for gripper to open
     node.wait_for_execution_complete(timeout=5.0)
@@ -706,7 +706,7 @@ def main(args=None):
         # FIXED: Wait for return to complete
         node.wait_for_execution_complete(timeout=10.0)
 
-    node.get_logger().info("Dollar bill pickup completed successfully!")
+    node.get_logger().info("Coin pickup completed successfully!")
     node.destroy_node()
     rclpy.shutdown()
 
